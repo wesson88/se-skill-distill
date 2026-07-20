@@ -1,0 +1,8 @@
+scripts/__pycache__/
+*.pyc
+_state/*.jsonl
+_state/audit/*.jsonl
+node_modules/
+*.tgz
+.DS_Store
+Thumbs.db

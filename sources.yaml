@@ -1,0 +1,82 @@
+# SkillMind 蒸馏源清单
+# 用法:
+#   1. 编辑本文件,在 sources: 列表下追加条目
+#   2. 跑: python scripts/pipeline.py --config sources.yaml
+#   3. 干跑: python scripts/pipeline.py --config sources.yaml --dry-run
+#
+# 字段说明:
+#   kind: 源类型
+#         - github_repo   : Git 仓库 URL(含子目录, 自动 clone + scan SKILL.md/CLAUDE.md 等)
+#         - github_raw    : GitHub raw 文件 URL(如 README), 单文件直下载
+#         - rss           : RSS / Atom Feed URL
+#         - single_url    : 单篇文章 / 博客 URL
+#         - local_dir     : 本地目录(递归扫 SKILL.md)
+#   url: 完整 URL(github_repo / rss / single_url 必填)
+#   path: 本地路径(local_dir 必填)
+#   target_role: 目标角色(强制路由,优先级最高)
+#                - 后端工程师    → B* 前缀
+#                - 前端工程师    → F* 前缀
+#                - 架构师        → A* 前缀
+#                - 技术主管      → TL* 前缀
+#                - 产品经理      → M* 前缀(0→1 起点)
+#                - auto          → 不指定,走关键词自动路由
+#   max_docs: 限流(RSS 模式生效,默认 50)
+#   notes: 备注(可选,仅用于团队沟通,不影响流水线)
+#
+# 注意:
+#   - 同 url 跑多次会自动 SHA256 去重,不会重复入 drafts/
+#   - target_role 显式指定优先级 > 关键词自动路由
+#   - 关键词自动路由失败时入 unknown-queue.md 等待人工处理
+
+sources:
+  # ===== 示例: 跑通 smoke test =====
+  # 用 single_url + raw.githubusercontent.com,避免被当 git 仓库 clone
+  - kind: single_url
+    url: https://raw.githubusercontent.com/tiangolo/fastapi/master/README.md
+    target_role: 后端工程师
+    notes: "smoke test 用,验证 5 阶段流水线"
+
+  # ===== 后端骨架(首批蒸馏) =====
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/mjhea0/awesome-fastapi/master/README.md
+  #   target_role: 后端工程师
+  #   notes: "FastAPI 全生态, 后端骨架源"
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/goldbergyoni/nodebestpractices/master/sections/errorhandling/README.md
+  #   target_role: 后端工程师
+  #   notes: "Node 错误处理 12 条, 直接套 B 系列"
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/Sairyss/domain-driven-hexagon/master/README.md
+  #   target_role: 后端工程师
+  #   notes: "DDD/Hexagonal/Clean, 后端 + 架构双用"
+
+  # ===== 前端骨架 =====
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/enaqx/awesome-react/master/README.md
+  #   target_role: 前端工程师
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/ryanmcdermott/clean-code-javascript/master/README.md
+  #   target_role: 前端工程师
+
+  # ===== 架构 =====
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/donnemartin/system-design-primer/master/README-zh-Hans.md
+  #   target_role: 架构师
+
+  # ===== 跨角色通用 =====
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/google/eng-practices/master/review/index.md
+  #   target_role: 技术主管
+  # - kind: single_url
+  #   url: https://raw.githubusercontent.com/OWASP/CheatSheetSeries/master/Index.md
+  #   target_role: auto  # 让关键词路由决定
+
+  # ===== RSS 订阅(博客批量) =====
+  # - kind: rss
+  #   url: https://web.dev/feed.xml
+  #   target_role: 前端工程师
+  #   max_docs: 5
+  # - kind: rss
+  #   url: https://newsletter.pragmaticengineer.com/feed
+  #   target_role: 技术主管
+  #   max_docs: 5
