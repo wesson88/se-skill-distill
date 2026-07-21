@@ -33,7 +33,7 @@ SOURCES = [
     ("system-design",        "https://raw.githubusercontent.com/donnemartin/system-design-primer/master/README-zh-Hans.md", "架构师"),
 ]
 
-OUT = Path("D:/Markdown/memory/adam/.claude/skills/se-skill-distill/calibration/calibration_data.jsonl")
+OUT = Path(__file__).parent / "calibration_data.jsonl"
 
 
 def ensure_published(url: str) -> str:

@@ -5,6 +5,26 @@
 
 ---
 
+## 安装(npm 全局,推荐)
+
+```bash
+npm install -g @wesson88/se-skill-distill
+# postinstall 自动复制 skill 到 ~/.claude/skills/se-skill-distill/
+
+# 使用前配置(全局安装后 vault 无法从 skill 位置自动推导):
+export SE_VAULT=<你的 vault 根>            # 必需
+# skillmind 前置:pip install skillmind,或 export SKILLMIND_REPO=<本地 skillMind 仓库>
+
+# 验证(应输出 preflight 通过):
+python ~/.claude/skills/se-skill-distill/scripts/preflight.py
+```
+
+skill 启动时(pipeline.py / distill_url.py)会自动 preflight 检查 vault + skillmind,不就绪会逐条给修复指引。
+
+> 也可从源码跑:`python pipeline.py --config sources.yaml`(需在 skill 目录,Python 能 import skillmind)。
+
+---
+
 ## 0. 怎么触发(30 秒上手)
 
 ```bash
@@ -60,7 +80,7 @@ python pipeline.py --config <path> [选项]
 
 | OS | 命令 |
 |---|---|
-| **Windows (PowerShell)** | `E:\workstation\ai\skillMind\.venv\Scripts\python.exe pipeline.py --config sources.yaml` |
+| **Windows (PowerShell)** | `python pipeline.py --config sources.yaml` |
 | **Linux / macOS (bash)** | `./.venv/bin/python pipeline.py --config sources.yaml` |
 
 Windows 建议前置:
@@ -154,7 +174,7 @@ sources:
 跑完一次典型输出:
 
 ```
-vault 根:D:\Markdown\memory\adam
+vault 根:<vault>
 === skillmind-to-vault 蒸馏流水线 ===
 源数: 1
 
@@ -307,6 +327,6 @@ python pipeline.py --config sources.yaml --vault "D:\my-vault"
 python pipeline.py --status
 
 # 跨平台
-# Windows:    E:\workstation\ai\skillMind\.venv\Scripts\python.exe pipeline.py ...
+# Windows:    python pipeline.py ...
 # Linux/mac:  .venv/bin/python pipeline.py ...
 ```

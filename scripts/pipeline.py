@@ -17,6 +17,13 @@ from typing import Any
 
 from rich.console import Console
 
+# 前置检查(在 import _common 前,避开其模块加载时的 vault 硬解析)
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+import preflight as _preflight
+_preflight.check()
+
 from _common import (
     LEDGER_FILE,
     STATE_DIR,

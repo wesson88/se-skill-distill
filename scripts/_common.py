@@ -316,7 +316,7 @@ def import_skillmind():
         raise RuntimeError(
             f"无法 import skillMind,请检查:\n"
             f"  1. SKILLMIND_REPO={SKILLMIND_ROOT} 正确?\n"
-            f"     (这是 skillMind 代码仓库路径,默认 E:\\workstation\\ai\\skillMind)\n"
+            f"     (这是 skillMind 代码仓库路径,默认 <skillMind-repo>)\n"
             f"  2. 当前 Python 包含 skillmind 包? sys.executable={sys.executable}\n"
             f"原始错误: {e}"
         ) from e

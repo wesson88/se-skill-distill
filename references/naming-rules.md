@@ -63,7 +63,7 @@ skill_refs:
 ```
 
 注意:
-- 用 vault 相对路径(`D:\Markdown\memory\adam\` 为根)
+- 用 vault 相对路径(<vault 根> 为根)
 - 用正斜杠(`/`)不用反斜杠
 - `os.path.normpath` 去重,避免大小写/斜杠差异导致的重复
 

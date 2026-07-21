@@ -1,0 +1,45 @@
+{
+  "name": "@wesson88/se-skill-distill",
+  "version": "0.1.0",
+  "description": "SE 域知识蒸馏 skill — 基于 skillMind 的 6 阶段流水线 (ingest→extract→publish→audit→route→inject)",
+  "license": "MIT",
+  "author": "wesson88",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wesson88/se-skill-distill.git"
+  },
+  "homepage": "https://github.com/wesson88/se-skill-distill#readme",
+  "bugs": {
+    "url": "https://github.com/wesson88/se-skill-distill/issues"
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "sources.yaml",
+    "scripts/",
+    "references/",
+    "calibration/",
+    "tests/",
+    "install.js",
+    "!scripts/__pycache__/",
+    "!**/*.pyc",
+    "!**/*.pyo"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "skill",
+    "skillmind",
+    "distill",
+    "obsidian",
+    "knowledge"
+  ]
+}

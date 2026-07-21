@@ -2,12 +2,13 @@
 Smoke Test: 端到端跑通 1 个 GitHub raw URL → 后端工程师 → 1 条新 skill → 角色基因 frontmatter 注入
 
 跑法:
-    cd D:\\Markdown\\memory\\adam\\.claude\\skills\\se-skill-distill
+    cd <se-skill-distill 目录>
     python tests/test_e2e_smoke.py
 """
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from pathlib import Path
 # 测试在 scripts/ 同级的 tests/ 下,但实际跑在仓库根
 TEST_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = TEST_DIR.parent
-VAULT_ROOT = SKILL_ROOT.parent.parent.parent  # .claude/skills/<x>/tests -> adam
+VAULT_ROOT = Path(os.environ.get("SE_VAULT") or SKILL_ROOT.parent.parent.parent)  # SE_VAULT 优先,否则从脚本位置推
 
 
 def run_step(cmd: list[str], desc: str) -> tuple[int, str, str]:

@@ -97,18 +97,17 @@ def render_sources_yaml(entries: list[dict]) -> str:
 
 
 def find_venv_python() -> str:
-    """找 skillMind 的 .venv python 解释器,fallback 到当前 python。"""
-    candidates = [
-        SE_ROOT.parent.parent / ".venv" / "Scripts" / "python.exe",  # skillMind 项目根
-        Path("E:/workstation/ai/skillMind/.venv/Scripts/python.exe"),
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
+    """返回当前 python 解释器。
+
+    preflight 已保证 sys.executable 能 import skillmind,直接用它。不再
+    硬编码/推导 skillMind venv 路径 —— npm 全局安装后 skill 位置与 skillMind
+    仓库无父子关系,旧的 SE_ROOT.parent.parent 推导和硬编码 E:/workstation 路径都会失效。
+    """
     return sys.executable
 
 
 def main() -> int:
+    import preflight; preflight.check()  # 前置检查 vault + skillmind
     parser = argparse.ArgumentParser(
         description="一键蒸馏:给一个 GitHub skill URL,跑 ingest → extract → audit → route → inject 全流程"
     )
