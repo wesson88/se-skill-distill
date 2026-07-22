@@ -21,11 +21,13 @@ from typing import Any
 import _common
 from _common import (
     LEDGER_FILE,
-    ROLE_TO_GENE_FILE,
     RoutedSkill,
     STATE_DIR,
     append_ledger,
     atomic_write_text,
+    create_role_gene_template,
+    ensure_role_dirs,
+    role_gene_file,
 )
 
 
@@ -188,11 +190,29 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
     body = "\n".join(body_lines)
 
     # frontmatter
+    # trigger:让 agent-workflow 能按关键词决定是否注入(缺 trigger 会被 fail-closed 跳过)
+    trig_kws: list[str] = []
+    tk = meta.get("trigger_keywords") or []
+    if isinstance(tk, list):
+        trig_kws = [str(x) for x in tk if str(x).strip()]
+    if not trig_kws:
+        tags = le.get("knowledge_tags") or []
+        if isinstance(tags, list):
+            trig_kws = [str(x) for x in tags if str(x).strip()]
+    if role and role not in trig_kws:
+        trig_kws.append(role)  # 角色名也作关键词,便于按角色触发
+
     fm_lines: list[str] = ["---"]
     fm_lines.append(f"role: {role}")
     fm_lines.append(f"skill_id: {skill_id}")
     fm_lines.append(f"type: {type_field}")
     fm_lines.append(f"lifecycle: NEW")
+    fm_lines.append("trigger:")
+    fm_lines.append("  always: false")
+    fm_lines.append("  keywords:")
+    for kw in trig_kws[:8]:
+        fm_lines.append(f"    - {json.dumps(kw, ensure_ascii=False)}")
+    fm_lines.append("  file_patterns: []")
     fm_lines.append(f"uuid: {draft.get('uuid', '')}")
     fm_lines.append(f"source_url: {source.get('source_url') or source.get('repo_url', '')}")
     fm_lines.append(f"source_hash: {source.get('source_hash', '')}")
@@ -210,29 +230,24 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
 # 角色基因 frontmatter 改写
 # ---------------------------------------------------------------------------
 
-def patch_role_gene(role: str, new_skill_filename: str, dry_run: bool = False) -> dict:
+def patch_role_gene(role: str, new_skill_filename: str, dry_run: bool = False, domain: str = "se") -> dict:
     """
     改 角色-{role}.md 的 frontmatter:
-    - skill_refs 追加 '20-知识/角色技能/se/{角色子目录}/{new_skill_filename}.md'
+    - skill_refs 追加 '20-知识/角色技能/{domain}/{role}/{new_skill_filename}.md'
     - rule_refs 追加 '[[{new_skill_filename}#3. 核心约束]]'
+    基因文件不存在时自动按模板创建(新角色零配置)。
     原子写 + .bak 备份 + ledger 记录。
     返回 {ok, relpath, prev_refs, new_refs, prev_rule_refs, new_rule_refs}
 
     若 dry_run=True,只返回 diff 不写盘。
     """
-    gene_file = ROLE_TO_GENE_FILE.get(role)
-    if gene_file is None or not gene_file.exists():
-        return {"ok": False, "error": f"角色基因文件不存在: {role} → {gene_file}"}
+    gene_file = role_gene_file(role, domain)
+    if not gene_file.exists():
+        if dry_run:
+            return {"ok": False, "error": f"角色基因文件不存在(dry-run 不自动建): {role} → {gene_file}"}
+        create_role_gene_template(role, domain)
 
-    subdir = {
-        "后端工程师": "后端工程师",
-        "前端工程师": "前端工程师",
-        "架构师": "架构师",
-        "技术主管": "技术主管",
-        "产品经理": "产品经理",
-    }[role]
-
-    new_skill_ref = f"20-知识/角色技能/se/{subdir}/{new_skill_filename}.md"
+    new_skill_ref = f"20-知识/角色技能/{domain}/{role}/{new_skill_filename}.md"
     new_rule_ref = f"[[{new_skill_filename}#3. 核心约束]]"
 
     if dry_run:
@@ -419,7 +434,7 @@ def inject_one(routed: RoutedSkill, draft: dict, dry_run: bool = False) -> dict:
     if not copy_result["ok"]:
         return {"ok": False, "stage": "copy", "error": copy_result.get("error")}
 
-    patch_result = patch_role_gene(routed.role, routed.new_filename, dry_run=dry_run)
+    patch_result = patch_role_gene(routed.role, routed.new_filename, dry_run=dry_run, domain=routed.domain)
     if not patch_result["ok"]:
         return {"ok": False, "stage": "patch", "error": patch_result.get("error"), "copy_result": copy_result}
 
@@ -462,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
                 new_filename=rd["new_filename"],
                 new_path=Path(rd["new_path"]),
                 target_subdir=Path(rd["target_subdir"]),
+                domain=rd.get("domain", "se"),
             )
             draft = _load_draft(routed.draft_path)
             if not draft:

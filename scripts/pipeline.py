@@ -50,7 +50,7 @@ def load_sources(config_path: Path) -> list[dict]:
     return sources
 
 
-def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = False) -> int:
+def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = False, domain: str = "se") -> int:
     """跑完整 5 阶段流水线。"""
     from rich.console import Console
     console = Console()
@@ -156,7 +156,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
             console.print(f"  [red]草稿丢失: {ar.draft_path}[/red]")
             continue
         src = {"url": "", "notes": ""}  # source_info 不全,简化
-        rs = route_mod.route_one(ar, draft, src, target_role_override=ar.role)
+        rs = route_mod.route_one(ar, draft, src, target_role_override=ar.role, domain=domain)
         if rs is None:
             route_mod.append_unknown_queue(ar, src, "role resolve failed")
             unknowns += 1
@@ -181,6 +181,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
                 "new_filename": rs.new_filename,
                 "new_path": str(rs.new_path),
                 "target_subdir": str(rs.target_subdir),
+                "domain": rs.domain,
             }, ensure_ascii=False) + "\n")
 
     # 阶段 5: inject
@@ -263,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="不写盘,只输出 diff")
     parser.add_argument("--skip-extract", action="store_true", help="跳过 extract(已存在 drafts/)")
     parser.add_argument("--status", action="store_true", help="显示运行状态")
+    parser.add_argument("--domain", default="se", help="角色域(默认 se;agent-workflow 当前只扫 se)")
     args = parser.parse_args(argv)
 
     if args.status:
@@ -281,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[ERROR] 找不到 config: {config_path}")
         return 1
 
-    return run_pipeline(config_path, dry_run=args.dry_run, skip_extract=args.skip_extract)
+    return run_pipeline(config_path, dry_run=args.dry_run, skip_extract=args.skip_extract, domain=args.domain)
 
 
 if __name__ == "__main__":

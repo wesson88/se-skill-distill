@@ -91,10 +91,11 @@ for d in (STATE_DIR, AUDIT_DIR, RETROSPECTIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# 角色映射
+# 角色映射(模板推导,支持任意角色 + 多 domain)
 # ---------------------------------------------------------------------------
 
-ROLE_TO_PREFIX = {
+# se 域预置前缀(约定字母,向后兼容);新角色用 role_prefix() 首字推导
+ROLE_PREFIX_PRESET = {
     "后端工程师": "B",
     "前端工程师": "F",
     "架构师": "A",
@@ -102,21 +103,58 @@ ROLE_TO_PREFIX = {
     "产品经理": "M",
 }
 
-ROLE_TO_SUBDIR = {
-    "后端工程师": "后端工程师",
-    "前端工程师": "前端工程师",
-    "架构师": "架构师",
-    "技术主管": "技术主管",
-    "产品经理": "产品经理",
-}
 
-ROLE_TO_GENE_FILE = {
-    "后端工程师": ROLE_GENE_DIR / "角色-后端工程师.md",
-    "前端工程师": ROLE_GENE_DIR / "角色-前端工程师.md",
-    "架构师": ROLE_GENE_DIR / "角色-架构师.md",
-    "技术主管": ROLE_GENE_DIR / "角色-技术主管.md",
-    "产品经理": ROLE_GENE_DIR / "角色-产品经理.md",
-}
+def role_prefix(role: str) -> str:
+    """角色 → 文件名前缀。预置 se 5 用约定字母;否则首字大写。"""
+    if role in ROLE_PREFIX_PRESET:
+        return ROLE_PREFIX_PRESET[role]
+    return (role[:1] or "X").upper()
+
+
+def skill_subdir(role: str, domain: str = "se") -> Path:
+    """角色 → skill 目录(绝对):VAULT_ROOT/20-知识/角色技能/{domain}/{role}"""
+    return VAULT_ROOT / "20-知识" / "角色技能" / domain / role
+
+
+def role_gene_file(role: str, domain: str = "se") -> Path:
+    """角色 → 基因文件(绝对):VAULT_ROOT/00-系统/角色基因/{domain}/角色-{role}.md"""
+    return VAULT_ROOT / "00-系统" / "角色基因" / domain / f"角色-{role}.md"
+
+
+def ensure_role_dirs(role: str, domain: str = "se") -> Path:
+    """确保角色 skill 目录存在(新角色自动建)。返回该目录。"""
+    d = skill_subdir(role, domain)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def create_role_gene_template(role: str, domain: str = "se") -> Path:
+    """基因文件不存在时按模板创建(新角色零配置)。返回该文件。"""
+    gf = role_gene_file(role, domain)
+    if gf.exists():
+        return gf
+    template = (
+        "---\n"
+        f"role: {role}\n"
+        "aliases: []\n"
+        f"domain: {domain}\n"
+        "skills: []\n"
+        'style: ""\n'
+        "skill_refs: []\n"
+        "rule_refs: []\n"
+        "---\n\n"
+        f"# {role}\n\n"
+        "(角色基因 — se-skill-distill 自动创建;蒸馏的 skill 会登记到 skill_refs)\n"
+    )
+    atomic_write_text(gf, template)
+    return gf
+
+
+# 向后兼容(旧代码 ROLE_TO_PREFIX[role] / ROLE_TO_SUBDIR[role] / ROLE_TO_GENE_FILE[role])
+# 新角色不在这些 dict 里 —— 调用方应改用 role_prefix() / skill_subdir() / role_gene_file()
+ROLE_TO_PREFIX = dict(ROLE_PREFIX_PRESET)
+ROLE_TO_SUBDIR = {r: r for r in ROLE_PREFIX_PRESET}
+ROLE_TO_GENE_FILE = {r: role_gene_file(r) for r in ROLE_PREFIX_PRESET}
 
 # 角色路由关键词(用于 auto 模式)
 KEYWORD_RULES = {
@@ -179,6 +217,7 @@ class RoutedSkill:
     new_filename: str  # "B8-空集守卫.md"
     new_path: Path  # 绝对路径
     target_subdir: Path
+    domain: str = "se"
 
 
 # ---------------------------------------------------------------------------

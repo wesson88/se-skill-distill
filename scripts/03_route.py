@@ -15,14 +15,13 @@ from typing import Any
 import _common
 from _common import (
     AuditResult,
-    ROLE_TO_PREFIX,
-    ROLE_TO_SUBDIR,
-    ROLE_TO_GENE_FILE,
     RoutedSkill,
     UNKNOWN_FILE,
     detect_role_from_text,
     find_next_skill_number,
+    role_prefix,
     safe_filename,
+    skill_subdir,
 )
 
 
@@ -44,7 +43,7 @@ def resolve_role(target_role: str | None, draft: dict, source: dict) -> str | No
       3. source url/notes 关键词命中
       4. None(标记 unknown,不入库)
     """
-    if target_role and target_role != "auto" and target_role in ROLE_TO_PREFIX:
+    if target_role and target_role != "auto":
         return target_role
 
     # 收集候选文本
@@ -108,18 +107,18 @@ def route_one(
     draft: dict,
     source: dict,
     target_role_override: str | None = None,
+    domain: str = "se",
 ) -> RoutedSkill | None:
     """
-    路由单条 approved draft → RoutedSkill。
+    路由单条 approved draft → RoutedSkill(支持任意角色 + 多 domain)。
     返回 None 表示无法路由(入 unknown-queue)。
     """
     role = resolve_role(target_role_override, draft, source)
-    if not role or role not in ROLE_TO_PREFIX:
+    if not role:
         return None
 
-    prefix = ROLE_TO_PREFIX[role]
-    subdir_name = ROLE_TO_SUBDIR[role]
-    subdir = _skill_dir() / subdir_name
+    prefix = role_prefix(role)
+    subdir = skill_subdir(role, domain)
 
     # 找下一个 N
     next_n = find_next_skill_number(subdir, prefix)
@@ -138,6 +137,7 @@ def route_one(
         new_filename=filename,
         new_path=new_path,
         target_subdir=subdir,
+        domain=domain,
     )
 
 
@@ -214,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
                 "new_filename": rs.new_filename,
                 "new_path": str(rs.new_path),
                 "target_subdir": str(rs.target_subdir),
+                "domain": rs.domain,
             }, ensure_ascii=False) + "\n")
     return 0
 

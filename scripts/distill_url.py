@@ -114,6 +114,7 @@ def main() -> int:
     parser.add_argument("url", help="GitHub URL(blob/tree/raw/owner-repo)或 owner/repo")
     parser.add_argument("--role", default="后端工程师", help="目标角色(默认后端工程师)")
     parser.add_argument("--vault", help="vault 根路径(默认从脚本位置推导)")
+    parser.add_argument("--domain", default="se", help="角色域(默认 se;agent-workflow 当前只扫 se)")
     parser.add_argument("--skip-extract", action="store_true", help="跳过 extract(用已有草稿)")
     parser.add_argument("--dry-run", action="store_true", help="干跑,不写 vault")
     parser.add_argument("--yes", "-y", action="store_true", help="跳过确认,直接跑")
@@ -149,6 +150,8 @@ def main() -> int:
         cmd = [venv_py, str(PIPELINE), "--config", str(SOURCES_YAML)]
         if args.vault:
             cmd.extend(["--vault", args.vault])
+        if args.domain and args.domain != "se":
+            cmd.extend(["--domain", args.domain])
         if args.skip_extract:
             cmd.append("--skip-extract")
         if args.dry_run:
