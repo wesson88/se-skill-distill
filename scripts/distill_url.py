@@ -137,12 +137,12 @@ def main() -> int:
         except EOFError:
             pass
 
-    # 备份原 sources.yaml
-    backup = SOURCES_YAML.read_text(encoding="utf-8") if SOURCES_YAML.exists() else None
+    # 备份原 sources.yaml(字节级,避免 read_text/write_text 在 Windows 转换行尾 LF→CRLF 污染 git)
+    backup = SOURCES_YAML.read_bytes() if SOURCES_YAML.exists() else None
 
     # 写临时 sources.yaml
     SOURCES_YAML.parent.mkdir(parents=True, exist_ok=True)
-    SOURCES_YAML.write_text(render_sources_yaml(entries), encoding="utf-8")
+    SOURCES_YAML.write_bytes(render_sources_yaml(entries).encode("utf-8"))
 
     try:
         # 跑 pipeline
@@ -161,7 +161,7 @@ def main() -> int:
     finally:
         # 还原 sources.yaml
         if backup is not None:
-            SOURCES_YAML.write_text(backup, encoding="utf-8")
+            SOURCES_YAML.write_bytes(backup)
         else:
             SOURCES_YAML.unlink(missing_ok=True)
 
