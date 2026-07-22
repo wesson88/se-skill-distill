@@ -1,6 +1,6 @@
 {
   "name": "@wesson88/se-skill-distill",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SE 域知识蒸馏 skill — 基于 skillMind 的 6 阶段流水线 (ingest→extract→publish→audit→route→inject)",
   "license": "MIT",
   "author": "wesson88",
