@@ -25,6 +25,35 @@ skill 启动时(pipeline.py / distill_url.py)会自动 preflight 检查 vault + 
 
 ---
 
+## 使用流程(端到端)
+
+**1. 安装 + 配置**(一次性,详见上节「安装」)
+```bash
+npm install -g @wesson88/se-skill-distill
+export SE_VAULT=<你的 vault 根>
+python ~/.claude/skills/se-skill-distill/scripts/preflight.py   # 验证 vault + skillmind 两项 ✓
+```
+
+**2. 蒸馏一个源**(最常见入口)
+```bash
+# 命令行一键蒸馏 GitHub URL(自动 ingest → extract → publish → audit → route → inject):
+python ~/.claude/skills/se-skill-distill/scripts/distill_url.py https://github.com/owner/repo --role 后端工程师
+```
+或在 Claude Code 里直接说「把这个 README 蒸馏到 vault」,skill 自动触发。
+
+**3. 看结果**(skill 目录的 `_state/` + vault)
+- `_state/audit/approved.jsonl` — coverage ≥ 90% 自动入 vault 的源
+- `_state/audit/manual-review.jsonl` — coverage < 90%,需人工 review `missing[]`
+- vault `20-知识/角色技能/se/<role>/B<n>-<title>.md` — 注入的 skill 文件
+- `00-系统/角色基因/se/角色-<role>.md` — frontmatter 自动追加 `skill_refs`
+
+**4. 批量蒸馏**(可选)
+编辑 `sources.yaml` 加多个源,跑 `python ~/.claude/skills/se-skill-distill/scripts/pipeline.py --config <sources.yaml 路径>`。
+
+> skill 每次启动会自动 preflight:vault/skillmind 不就绪会逐条给修复指引并退出,不会跑到一半才崩。
+
+---
+
 ## 0. 怎么触发(30 秒上手)
 
 ```bash

@@ -29,7 +29,8 @@
     "postinstall": "node install.js"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "@wesson88:registry": "https://npm.pkg.github.com"
   },
   "engines": {
     "node": ">=18"
