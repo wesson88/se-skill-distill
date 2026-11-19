@@ -42,8 +42,8 @@ python ~/.claude/skills/se-skill-distill/scripts/distill_url.py https://github.c
 或在 Claude Code 里直接说「把这个 README 蒸馏到 vault」,skill 自动触发。
 
 **3. 看结果**(skill 目录的 `_state/` + vault)
-- `_state/audit/approved.jsonl` — coverage ≥ 90% 自动入 vault 的源
-- `_state/audit/manual-review.jsonl` — coverage < 90%,需人工 review `missing[]`
+- `_state/audit/approved.jsonl` — 只有 skillmind `verdict=PASS` 才自动入 vault
+- `_state/audit/manual-review.jsonl` — `FAIL` 或 `UNKNOWN`，需人工 review `missing[]`
 - vault `20-知识/角色技能/se/<role>/B<n>-<title>.md` — 注入的 skill 文件
 - `00-系统/角色基因/se/角色-<role>.md` — frontmatter 自动追加 `skill_refs`
 
@@ -191,10 +191,11 @@ sources:
 
 **audit 判定**(stage 3 输出):
 
-| coverage | verdict | needs_human_review | 后续 |
-|---|---|---|---|
-| ≥ 90% | `PASS` | `false` | 自动进 stage 4-5 |
-| < 90% | `FAIL` | `true` | 停在该源,等人工 review `missing[]` |
+| verdict | needs_human_review | 后续 |
+|---|---|---|
+| `PASS` | `false` | 自动进 stage 4-5。coverage 只是记录 |
+| `FAIL` | `true` | 停在该源,等人工 review `missing[]` |
+| `UNKNOWN` | `true` | 同样停住。不能把缺字段或未跑完的门当成通过 |
 
 ---
 

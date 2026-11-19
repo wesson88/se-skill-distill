@@ -1,11 +1,11 @@
 """
-阶段 2+3: Extract + Audit (v3 — 对齐 skillMind 2.3+ 精简 audit)
+阶段 2+3: Extract + Audit (v4 — 只认 skillmind verdict)
 
 - 阶段 2: 调 skillmind.extractor.extract_skill (LLM 调用)
 - 阶段 2.5: 调 skillmind publish --all,把草稿发到 ~/.skillmind/vault/skills/
-- 阶段 3: 调 skillmind.auditor.audit_source (LLM Pass 1+2),本层不重算 score
-         coverage ≥ 90% → PASS(自动放行,无需 review)
-         coverage < 90% → FAIL(needs_human_review=True,走人工)
+- 阶段 3: 调 skillmind.auditor.audit_source。coverage 仍记录，但不能单独放行。
+         verdict PASS 才进 approved。FAIL 与 UNKNOWN 都进人工。
+         幻觉检查没跑时 hallucination_rate 为 null，不是 0。
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from _common import (
     ensure_skillmind_venv,
     import_skillmind,
 )
+from audit_decision import attach_yaml_roles, interpret_report
 
 
 # ---------------------------------------------------------------------------
@@ -123,27 +124,23 @@ def audit_one(source_info: dict, role: str) -> AuditResult:
         vault_skills_override=str(vault_skills),
     )
 
-    # 简化 notes:只标注关键异常
-    notes: list[str] = []
-    if report.needs_human_review:
-        notes.append(
-            f"coverage {report.coverage_weighted:.1f}% < {auditor.PASS_COVERAGE_THRESHOLD:.0f}% 阈值,需人工 review"
-        )
-    if len(report.hallucinations) > 0:
-        notes.append(
-            f"hallucinations {len(report.hallucinations)} 条,数字/wikilink 失真"
-        )
-
+    decision = interpret_report(report)
     return AuditResult(
         source_hash=source_info.get("source_hash", ""),
         draft_path=_find_draft_path(source_info.get("source_hash", "")),
         role=role,
-        coverage=report.coverage_weighted,             # 0-100
-        hallucination_rate=len(report.hallucinations) / max(len(report.items), 1),
-        needs_human_review=report.needs_human_review,
-        missing=report.missing,
-        verdict=report.verdict,                        # PASS / FAIL
-        notes=notes,
+        coverage=decision["coverage"],
+        hallucination_rate=decision["hallucination_rate"],
+        hallucination_checked=decision["hallucination_checked"],
+        hallucination_count=decision["hallucination_count"],
+        needs_human_review=decision["needs_human_review"],
+        missing=list(getattr(report, "missing", None) or []),
+        verdict=decision["verdict"],
+        completeness_status=decision["completeness_status"],
+        executability_status=decision["executability_status"],
+        faithfulness=decision["faithfulness"],
+        quality_current=decision["quality_current"],
+        notes=decision["notes"],
     )
 
 
@@ -169,18 +166,18 @@ def _find_draft_path(source_hash: str) -> str:
 
 
 def write_audit_results(results: list[AuditResult]) -> None:
-    """按 verdict 分文件写。对齐 skillMind 新判定:
-       - PASS(≥90%) → approved.jsonl(自动放行)
-       - FAIL(<90%) → manual-review.jsonl(需人工)
-       - rejected.jsonl 保留以备硬错误(本版暂未用,空文件)
+    """按 verdict 分文件写。
+       - 只有 PASS 进 approved.jsonl
+       - FAIL 与 UNKNOWN 都进 manual-review.jsonl
+       - rejected.jsonl 留给硬错误,这里仍为空
     """
     for fp in (APPROVED_FILE, REVIEW_FILE, REJECT_FILE):
         fp.parent.mkdir(parents=True, exist_ok=True)
         if fp.exists():
             fp.unlink()
     approved = [r for r in results if r.verdict == "PASS"]
-    review = [r for r in results if r.verdict == "FAIL"]
-    rejected: list[AuditResult] = []   # 新判定无 rejected,留空 list
+    review = [r for r in results if r.verdict != "PASS"]
+    rejected: list[AuditResult] = []
     for fp, items in ((APPROVED_FILE, approved), (REVIEW_FILE, review), (REJECT_FILE, rejected)):
         with fp.open("w", encoding="utf-8") as f:
             for r in items:
@@ -227,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         from skillmind.collector import list_cached
         cached = list_cached()
         # 转成与 extract_results 等价的 shape,便于后续 audit 循环
+        attach_yaml_roles(cached, sources)
         extract_results = [{"source": c, "drafts": []} for c in cached]
         console.print(f"[bold]跳过 extract,直接 audit 已存在草稿 ({len(extract_results)} 源)[/bold]")
 
@@ -254,10 +252,15 @@ def main(argv: list[str] | None = None) -> int:
             ar = audit_one(src, role)
             audit_results.append(ar)
             # 终端 summary:对齐 skillMind 精简 JSON
+            coverage_text = "n/a" if ar.coverage is None else f"{ar.coverage:.1f}%"
+            halluc_text = "not-run" if not ar.hallucination_checked else (
+                "n/a" if ar.hallucination_rate is None else f"{ar.hallucination_rate:.2f}"
+            )
             console.print(
-                f"  coverage={ar.coverage:.1f}%  verdict={ar.verdict}  "
-                f"needs_review={ar.needs_human_review}  halluc={ar.hallucination_rate:.2f}  "
-                f"missing={len(ar.missing)}"
+                f"  coverage={coverage_text}  verdict={ar.verdict}  "
+                f"completeness={ar.completeness_status}  executability={ar.executability_status}  "
+                f"needs_review={ar.needs_human_review}  halluc={halluc_text}  "
+                f"missing={len(ar.missing)}  role={role}"
             )
             for note in ar.notes:
                 console.print(f"    [yellow]note:[/yellow] {note}")
@@ -267,9 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     write_audit_results(audit_results)
     n_pass = sum(1 for r in audit_results if r.verdict == "PASS")
     n_fail = sum(1 for r in audit_results if r.verdict == "FAIL")
+    n_unknown = sum(1 for r in audit_results if r.verdict == "UNKNOWN")
     console.print(
         f"\n[bold green]完成[/bold green] PASS={n_pass} "
-        f"FAIL={n_fail} / 总源 {len(audit_results)}"
+        f"FAIL={n_fail} UNKNOWN={n_unknown} / 总源 {len(audit_results)}"
     )
     return 0
 

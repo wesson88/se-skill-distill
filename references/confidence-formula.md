@@ -1,4 +1,18 @@
-# 90% 阈值审计规则
+# 审计放行规则
+
+skillmind 2.4 起，放行只看 `verdict`。`coverage` 仍记录，但不能单独放行。`UNKNOWN` 不是通过。`hallucination.checked` 为 false 时没有 rate，不能当成 0。
+
+| verdict | 下游 |
+|---|---|
+| `PASS` | 两道门都通过，才自动进入 route / inject |
+| `FAIL` | 人工 review `missing[]` |
+| `UNKNOWN` | 人工 review。常见原因是忠实度无法核对，或幻觉检查没跑完 |
+
+`quality_current` 只表示 schema 是当前版本，不是质量通过。
+
+下面保留旧的 90% 说明，只作 coverage 字段的来历。它不再决定 PASS。
+
+# 旧：90% 阈值
 
 ## 目标
 

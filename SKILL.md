@@ -1,6 +1,6 @@
 ---
 name: se-skill-distill
-description: 当用户给出 GitHub skill URL(blob/tree/raw/owner-repo)并说"蒸馏它"或"把这个抽取到 vault"时使用,或在用户要求"把 SKILL.md / README / 博客 / 论坛等源蒸馏成 SE 域知识"时使用。本 skill 编排 6 阶段流水线(ingest → extract → audit → route → inject),通过 audit 质量校验(coverage ≥ 90% 自动入 vault,< 90% 需人工 review),自动改角色基因 frontmatter。适用于 SE 域(后端/前端/架构/技术主管/产品经理)的知识沉淀。可用 `python distill_url.py <URL>` 一键蒸馏单个 GitHub 源。
+description: 当用户给出 GitHub skill URL(blob/tree/raw/owner-repo)并说"蒸馏它"或"把这个抽取到 vault"时使用,或在用户要求"把 SKILL.md / README / 博客 / 论坛等源蒸馏成 SE 域知识"时使用。本 skill 编排 6 阶段流水线(ingest → extract → audit → route → inject),通过 audit 质量校验(只有 skillmind verdict=PASS 才自动入 vault,FAIL 与 UNKNOWN 需人工 review),自动改角色基因 frontmatter。适用于 SE 域(后端/前端/架构/技术主管/产品经理)的知识沉淀。可用 `python distill_url.py <URL>` 一键蒸馏单个 GitHub 源。
 ---
 
 # se-skill-distill 使用说明
@@ -158,16 +158,16 @@ vault 根路径解析顺序:
 | 1 | **ingest** | 抓源到 `~/.skillmind/cache/raw/` | ❌ |
 | 2 | **extract** | LLM 抽草稿到 `~/.skillmind/drafts/` | `--skip-extract` |
 | 2.5 | **publish** | drafts 写进 vault | `--skip-publish` |
-| 3 | **audit** | 算 coverage,判 PASS/FAIL | ❌ |
+| 3 | **audit** | 只认 skillmind verdict，UNKNOWN 不放行 | ❌ |
 | 4 | **route** | 按 role 选子目录,生成 `B<n>-<title>.md` | 若 audit FAIL 整体跳过 |
 | 5 | **inject** | 写 skill + patch 角色基因 | ❌ |
 
 **audit 判定**(stage 3 输出):
 
-| coverage | verdict | needs_human_review | 后续 |
-|---|---|---|---|
-| ≥ 90% | `PASS` | `false` | 自动进 stage 4-5 |
-| < 90% | `FAIL` | `true` | 停在该源,等人工 review `missing[]` |
+| verdict | needs_human_review | 后续 |
+|---|---|---|
+| `PASS` | `false` | 自动进 stage 4-5 |
+| `FAIL` 或 `UNKNOWN` | `true` | 停在该源,等人工 review |
 
 ---
 

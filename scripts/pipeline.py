@@ -102,8 +102,8 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
     else:
         console.print("  [yellow]dry_run: 跳过 publish[/yellow]")
 
-    # 阶段 3: audit(直接读 skillMind 精简 AuditReport,coverage ≥ 90% → PASS)
-    console.print("\n[bold]━━━ 阶段 3: audit (skillMind LLM, 90% 阈值) ━━━[/bold]")
+    # 阶段 3: 只认 skillmind verdict。UNKNOWN 不进后续注入。
+    console.print("\n[bold]━━━ 阶段 3: audit (skillmind verdict) ━━━[/bold]")
 
     audit_results: list = []
     seen_hashes: set[str] = set()
@@ -122,9 +122,14 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
         try:
             ar = audit_mod.audit_one(src, role)
             audit_results.append(ar)
+            coverage_text = "n/a" if ar.coverage is None else f"{ar.coverage:.1f}%"
+            halluc_text = "not-run" if not ar.hallucination_checked else (
+                "n/a" if ar.hallucination_rate is None else f"{ar.hallucination_rate:.2f}"
+            )
             console.print(
-                f"  coverage={ar.coverage:.1f}%  verdict={ar.verdict}  "
-                f"needs_review={ar.needs_human_review}  halluc={ar.hallucination_rate:.2f}  "
+                f"  coverage={coverage_text}  verdict={ar.verdict}  "
+                f"completeness={ar.completeness_status}  executability={ar.executability_status}  "
+                f"needs_review={ar.needs_human_review}  halluc={halluc_text}  "
                 f"missing={len(ar.missing)}  role={ar.role}"
             )
             for note in ar.notes:
@@ -136,10 +141,11 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
 
     n_pass = sum(1 for r in audit_results if r.verdict == "PASS")
     n_fail = sum(1 for r in audit_results if r.verdict == "FAIL")
-    console.print(f"\n  PASS={n_pass}  FAIL={n_fail}  / 总源 {len(audit_results)}")
+    n_unknown = sum(1 for r in audit_results if r.verdict == "UNKNOWN")
+    console.print(f"\n  PASS={n_pass}  FAIL={n_fail}  UNKNOWN={n_unknown}  / 总源 {len(audit_results)}")
 
     if n_pass == 0:
-        console.print("[yellow]无 PASS(coverage 都 < 90%),后续阶段跳过[/yellow]")
+        console.print("[yellow]无 PASS(verdict 不是 PASS),后续阶段跳过[/yellow]")
         return 0
 
     # 阶段 4: route

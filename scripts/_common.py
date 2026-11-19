@@ -186,17 +186,21 @@ KEYWORD_RULES = {
 
 @dataclass
 class AuditResult:
-    """审计产出。本层不再重算 score,直接读 skillMind audit_source() 的判定。
-    字段对齐 skillMind 2.3+ 的 AuditReport(精简 JSON)。
-    """
+    """审计产出。放行只看 skillmind 的 verdict，不看 coverage 单值。"""
     source_hash: str
     draft_path: str
     role: str
-    coverage: float = 0.0              # 0-100,直接读 skillMind.coverage_weighted
-    hallucination_rate: float = 0.0     # 0-1,len(hallucinations) / len(items)
-    needs_human_review: bool = False    # 直接读 skillMind.needs_human_review
-    missing: list[dict] = field(default_factory=list)   # [{section, statement, reason}]
-    verdict: str = "unknown"            # PASS / FAIL(直接读 skillMind.verdict)
+    coverage: float | None = None
+    hallucination_rate: float | None = None
+    hallucination_checked: bool = False
+    hallucination_count: int | None = None
+    needs_human_review: bool = True
+    missing: list[dict] = field(default_factory=list)
+    verdict: str = "UNKNOWN"            # PASS / FAIL / UNKNOWN
+    completeness_status: str | None = None
+    executability_status: str | None = None
+    faithfulness: str | None = None
+    quality_current: bool | None = None
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
