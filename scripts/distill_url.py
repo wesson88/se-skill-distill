@@ -17,6 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
+from source_types import is_github_skill_url
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SE_ROOT = SCRIPT_DIR.parent
@@ -45,7 +46,7 @@ def resolve_url(url: str) -> list[dict]:
 
     # 形式 2: 已经是 raw
     if host == "raw.githubusercontent.com":
-        return [{"kind": "single_url", "url": url, "target_role": "auto", "notes": notes}]
+        return [{"kind": "github_raw" if is_github_skill_url(url) else "single_url", "url": url, "target_role": "auto", "notes": notes}]
 
     # 形式 3: GitHub blob URL
     if host in ("github.com", "www.github.com"):
@@ -57,7 +58,7 @@ def resolve_url(url: str) -> list[dict]:
                 branch = parts[3]
                 file_path = "/".join(parts[4:])
                 raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
-                return [{"kind": "single_url", "url": raw_url, "target_role": "auto", "notes": notes}]
+                return [{"kind": "github_raw" if is_github_skill_url(raw_url) else "single_url", "url": raw_url, "target_role": "auto", "notes": notes}]
             # /tree/<branch>/<subdir>
             if len(parts) >= 4 and parts[2] == "tree":
                 branch = parts[3]
@@ -107,7 +108,7 @@ def find_venv_python() -> str:
 
 
 def main() -> int:
-    import preflight; preflight.check()  # 前置检查 vault + skillmind
+    import preflight
     parser = argparse.ArgumentParser(
         description="一键蒸馏:给一个 GitHub skill URL,跑 ingest → extract → audit → route → inject 全流程"
     )
@@ -119,6 +120,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="干跑,不写 vault")
     parser.add_argument("--yes", "-y", action="store_true", help="跳过确认,直接跑")
     args = parser.parse_args()
+    preflight.check(args.vault)
 
     entries = resolve_url(args.url)
     for e in entries:

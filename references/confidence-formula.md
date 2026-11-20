@@ -1,85 +1,19 @@
-# 90% 阈值审计规则
+# 审计结果消费契约（0.2）
 
-## 目标
+SE 层不计算置信度或覆盖阈值，直接消费 SkillMind v2.5 返回的语义结论，并验证产物对应关系。
 
-`audit_extract(source_hash, draft) -> AuditResult`,核心字段 `verdict` ∈ {`PASS`, `FAIL`}。
+| verdict | 处理 |
+|---|---|
+| PASS，且 `needs_human_review: false` | 证据完整时允许路由/入库；语义 Skill 还需四维均 PASS |
+| FAIL | 写人工复核，保留明确失败与缺口，禁止入库 |
+| UNKNOWN | 写人工复核，保留未完成/格式/证据/运行错误，禁止入库 |
 
-## 判定
+四维为 `coverage_status`、`support_status`、`synthesis_status`、`source_inventory_status`。分别检查原文内容覆盖、输出主张的来源支持、知识重组和来源台账完整性。覆盖率是显示字段，可为 null；数字满分不代表四维都通过，也不能用旧百分比规则覆盖 verdict。
 
-读取 `skillmind.auditor.audit_source()` 的 `coverage_weighted`(0-100):
+`AuditResult` 保留原有来源、角色、missing 和 notes，并增加 schema/audit 版本、四维状态、完整 `audit_details`、全部 `draft_paths`、草稿 `draft_sha256`、暂存 `artifact_paths` 与 `artifact_sha256`。只有来源草稿、验证过的暂存证据和 `report.extract_files` 完全对应才可批准。审计前后文件变化、缺卡或证据替换使结果不可批准。
 
-```
-if coverage >= 90%:
-    verdict = "PASS"
-    needs_human_review = False
-else:
-    verdict = "FAIL"
-    needs_human_review = True
-```
+来源存在有效失败维度时，SkillMind 可能同时返回 FAIL 与其他维度的 `evaluation_errors`。保留该明确 FAIL 和详细错误；不能清空为“未发现问题”。对矛盾或不完整的 PASS 按 UNKNOWN 处理。
 
-| coverage | verdict | needs_human_review | 下游动作 |
-|---|---|---|---|
-| ≥ 90% | `PASS` | `false` | 自动放行(进入 route / inject / publish) |
-| < 90% | `FAIL` | `true` | 走人工 review `missing[]` 列表后回归抽取 |
+非 Skill 文档继续使用当前 SkillMind 的原有审计，其 legacy 结果不伪装为新语义四维 PASS。缺少当前证据的旧 Skill 需要重新提炼，不能套用旧覆盖分数放行。
 
-## 数据来源
-
-`skillmind.auditor.audit_source()` 的精简 `AuditReport.to_summary_dict()`:
-
-```python
-{
-    "source_hash": "b0c4837e...",
-    "source_title": "SKILL.md",
-    "coverage": 96.3,
-    "verdict": "PASS",
-    "needs_human_review": False,
-    "missing": [
-        {"section": "...", "statement": "...", "reason": "..."},
-        ...
-    ]
-}
-```
-
-`missing[]` 每条 `{section, statement, reason}` — `reason` 来自 Pass 2 LLM,说明该 items 在 source 哪一节、extract 为什么漏(没提到 / 简化掉 / 放错章节)。
-
-## audit 内部流程(skillmind)
-
-1. **Pass 1(LLM,~3-10s)** — 从 source 按 `##/###` 章节抽可验证条目(items),每条 ≤ 30 字陈述 + section 引用
-2. **Pass 2(LLM,~5-15s)** — 对每个 item 逐条 vs extract 卡片:
-   - `complete` — extract 中有 verbatim 保留
-   - `weak` — 有但简化 / 改写
-   - `missing` — 完全找不到(强制给 reason)
-3. **规则扫** — 数字 / URL / wikilink 反查(0 halluc 是底线)+ 跨卡重复(多卡时,跳过 frontmatter)
-
-coverage = `(complete + 0.5*weak) / total * 100`
-
-## 上游设置建议
-
-```yaml
-# ~/.skillmind/config.yaml
-llm_profiles:
-  extract:
-    model: deepseek/deepseek-chat        # 提取模型
-  audit:
-    model: anthropic/claude-3-5-haiku  # 故意不同模型(交叉验证,避免自审自)
-```
-
-## 给本层(`se-skill-distill`)的接口
-
-```python
-from skillmind.auditor import audit_source
-r = audit_source(source_hash, cfg)
-# r.coverage_weighted (0-100)
-# r.verdict          ('PASS' / 'FAIL')
-# r.needs_human_review (bool)
-# r.missing         (list of {section, statement, reason})
-
-# 本层不再重算 score,不再读 kind_coverages / score_breakdown 等旧字段
-# 简化 AuditResult 字段:coverage / needs_human_review / missing / verdict / notes
-```
-
-## 历史
-
-- v1 (4 维评分 `0.55/0.20/0.15/0.10` + approved/review/rejected 3 档)— 已废弃,heuristic 模式对长文低估
-- v2 (kind 加权 score + 同 3 档)— 已废弃,LLM 主观打分漂移大
-- **v3 (本版,90% 阈值 + PASS/FAIL 2 档)** — 简化为单阈值二元判定,verdict 由 skillMind LLM Pass 1+2 给出
+最终角色文件重新绑定 `{artifact_sha256, draft}` 证据信封。入库前验证批准记录、源哈希、草稿字节和内容；渲染保留规范正文，回滚同时处理正文与证据。最终 type 为 skill，触发词取自已审数据，并按当前 vault §10.4 检查目录内可区分性；不向角色基因添加 refs。哈希证明文件一致性，不是语义真假的证明。

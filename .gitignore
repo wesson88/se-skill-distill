@@ -1,7 +1,9 @@
 scripts/__pycache__/
 *.pyc
-_state/*.jsonl
-_state/audit/*.jsonl
+_state/
+.pytest_cache/
+tests/__pycache__/
+.venv/
 node_modules/
 *.tgz
 .DS_Store

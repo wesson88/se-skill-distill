@@ -1,288 +1,363 @@
-"""
-阶段 2+3: Extract + Audit (v3 — 对齐 skillMind 2.3+ 精简 audit)
-
-- 阶段 2: 调 skillmind.extractor.extract_skill (LLM 调用)
-- 阶段 2.5: 调 skillmind publish --all,把草稿发到 ~/.skillmind/vault/skills/
-- 阶段 3: 调 skillmind.auditor.audit_source (LLM Pass 1+2),本层不重算 score
-         coverage ≥ 90% → PASS(自动放行,无需 review)
-         coverage < 90% → FAIL(needs_human_review=True,走人工)
-"""
+"""Scoped SkillMind extraction, staging and conservative v2.5 audit adapter."""
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import asdict, is_dataclass
+import hashlib
 import json
-import subprocess
-import sys
+import math
 from pathlib import Path
-from typing import Any
+import sys
+import tempfile
 
-from _common import (
-    AuditResult,
-    AUDIT_DIR,
-    APPROVED_FILE,
-    REJECT_FILE,
-    REVIEW_FILE,
-    ensure_skillmind_venv,
-    import_skillmind,
-)
+import _common as common
+from _common import AuditResult, ensure_skillmind_venv, import_skillmind
 
+SEMANTIC_SCHEMA = "semantic_distillation_v1"
+DIMENSIONS = ("coverage_status", "support_status", "synthesis_status", "source_inventory_status")
+STATUSES = frozenset(("PASS", "FAIL", "UNKNOWN"))
 
-# ---------------------------------------------------------------------------
-# 阶段 2: Extract(保留原 v1 实现)
-# ---------------------------------------------------------------------------
 
 def extract_one(source_info: dict, console=None) -> list[dict]:
-    """调 skillMind extractor 对单个 source 提取知识单元。"""
     ensure_skillmind_venv()
     _, extractor, config = import_skillmind()
-    cfg = config.load_config()
-
-    raw_path = source_info["raw_path"]
-    drafts = extractor.extract_skill(raw_path, source_info, cfg, console=console)
-    return drafts
+    return extractor.extract_skill(source_info["raw_path"], source_info, config.load_config(), console=console)
 
 
 def extract_batch(source_infos: list[dict], console=None) -> list[dict]:
-    """批量 extract。"""
-    results: list[dict] = []
-    for i, info in enumerate(source_infos, 1):
-        if console:
-            console.print(f"[cyan]({i}/{len(source_infos)}) 提取:[/cyan] {info.get('title') or info.get('source_url', '')}")
+    results = []
+    for info in source_infos:
         try:
-            drafts = extract_one(info, console=console)
-            results.append({"source": info, "drafts": drafts})
-            if console:
-                console.print(f"  [green]OK[/green] {len(drafts)} 张草稿")
-        except Exception as e:
-            if console:
-                console.print(f"  [bold red]FAIL[/bold red] 失败: {e}")
-            results.append({"source": info, "drafts": [], "error": str(e)})
+            results.append({"source": info, "drafts": extract_one(info, console=console)})
+        except Exception as exc:
+            results.append({"source": info, "drafts": [], "error": f"Extraction failed ({type(exc).__name__})"})
     return results
 
 
-# ---------------------------------------------------------------------------
-# 阶段 2.5: publish_to_vault(新)
-# ---------------------------------------------------------------------------
-
-def publish_all_drafts(console=None) -> int:
-    """调 skillmind publish --all,把 drafts/ 下草稿发到 vault/skills/。
-
-    audit_source 要求"笔记已 publish 到 vault"才能扫到 frontmatter.source_hash。
-    """
-    proc = subprocess.run(
-        ["skillmind", "publish", "--all"],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    if proc.returncode != 0:
-        if console:
-            console.print(f"  [bold red]FAIL[/bold red] publish 失败: {proc.stderr[:200]}")
-        return 0
-    # 解析 stdout 拿 published 数量
-    n_published = 0
-    for line in proc.stdout.splitlines():
-        if "✓" in line or "published" in line.lower():
-            n_published += 1
-    if console:
-        console.print(f"  [green]OK[/green] published {n_published} 草稿")
-    return n_published
+def _source_hash(draft: dict) -> str:
+    source = draft.get("source")
+    nested = source.get("source_hash") if isinstance(source, dict) else None
+    return str(nested or draft.get("source_hash") or "")
 
 
-# ---------------------------------------------------------------------------
-# 阶段 3: Audit(直接读 skillMind 精简 AuditReport,不再本层重算)
-# ---------------------------------------------------------------------------
-
-def audit_one(source_info: dict, role: str) -> AuditResult:
-    """
-    对单个 source_hash 调 skillMind audit_source,直接读 verdict + coverage + missing。
-    skillMind 的 LLM Pass 1+2 已是 ground truth,本层不再算 score / kind_coverages。
-
-    重要: 调之前必须已 publish 草稿到 vault/skills/(阶段 2.5)。
-    同一 source_hash 多张草稿 → 1 次 audit(Pass 1 抽 items 不重复)。
-    """
-    ensure_skillmind_venv()
-    _, _, config_mod = import_skillmind()
-    import skillmind.auditor as auditor
-    cfg = config_mod.load_config()
-
-    raw_path = Path(source_info["raw_path"])
-    if not raw_path.exists():
-        raise FileNotFoundError(f"原文不存在: {raw_path}")
-
-    vault_skills = Path.home() / ".skillmind" / "vault" / "skills"
-    if not vault_skills.exists():
-        raise RuntimeError(
-            f"vault_skills 目录不存在: {vault_skills}\n"
-            f"请先在 pipeline 阶段 2.5 publish 草稿"
-        )
-
-    # 调 skillMind audit_source(LLM Pass 1+2,返回精简 AuditReport)
-    report = auditor.audit_source(
-        source_info["source_hash"],
-        cfg=cfg,
-        console=None,
-        max_extract_files=10,
-        vault_skills_override=str(vault_skills),
-    )
-
-    # 简化 notes:只标注关键异常
-    notes: list[str] = []
-    if report.needs_human_review:
-        notes.append(
-            f"coverage {report.coverage_weighted:.1f}% < {auditor.PASS_COVERAGE_THRESHOLD:.0f}% 阈值,需人工 review"
-        )
-    if len(report.hallucinations) > 0:
-        notes.append(
-            f"hallucinations {len(report.hallucinations)} 条,数字/wikilink 失真"
-        )
-
-    return AuditResult(
-        source_hash=source_info.get("source_hash", ""),
-        draft_path=_find_draft_path(source_info.get("source_hash", "")),
-        role=role,
-        coverage=report.coverage_weighted,             # 0-100
-        hallucination_rate=len(report.hallucinations) / max(len(report.items), 1),
-        needs_human_review=report.needs_human_review,
-        missing=report.missing,
-        verdict=report.verdict,                        # PASS / FAIL
-        notes=notes,
-    )
-
-
-def _find_draft_path(source_hash: str) -> str:
-    """根据 source_hash 在 drafts/ 下找对应的 draft JSON 路径(route 阶段要读 JSON)。
-    draft 文件中 source_hash 在嵌套 source.source_hash 里,兼容两种取法。
-    """
-    if not source_hash:
-        return ""
-    drafts_dir = Path.home() / ".skillmind" / "drafts"
-    if not drafts_dir.exists():
-        return ""
-    for df in sorted(drafts_dir.glob("*.json")):
+def _drafts_for(source_hash: str, config) -> list[tuple[Path, dict]]:
+    found = []
+    for path in sorted(Path(config.DRAFTS_DIR).glob("*.json")):
         try:
-            d = json.loads(df.read_text(encoding="utf-8"))
-        except Exception:
+            draft = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        # 优先:嵌套的 source.source_hash;fallback:顶层 source_hash
-        sh = d.get("source", {}).get("source_hash") or d.get("source_hash")
-        if sh == source_hash:
-            return str(df)
+        if isinstance(draft, dict) and _source_hash(draft) == source_hash:
+            found.append((path.resolve(), draft))
+    return found
+
+
+def _validate_draft(draft: dict, source_info: dict) -> None:
+    from skillmind.distillation import validate_distillation
+    schema = draft.get("schema_version", "")
+    source = draft.get("source") or {}
+    if not isinstance(source, dict):
+        raise ValueError("Draft source must be an object")
+    doc_type = source.get("doc_type", draft.get("doc_type", source_info.get("doc_type", "skill")))
+    if schema and schema != SEMANTIC_SCHEMA:
+        raise ValueError("Unsupported draft schema")
+    if schema == SEMANTIC_SCHEMA or doc_type == "skill":
+        if schema != SEMANTIC_SCHEMA or draft.get("extract_complete") is not True:
+            raise ValueError("Semantic extraction is incomplete or lacks its canonical schema")
+        errors = validate_distillation(draft.get("distillation"))
+        if errors:
+            raise ValueError("Invalid semantic draft: " + "; ".join(errors))
+        if draft["distillation"]["uncovered"]:
+            raise ValueError("Semantic draft still contains uncovered source units")
+        if not isinstance(draft.get("uuid"), str) or not draft["uuid"].strip():
+            raise ValueError("Semantic draft requires a UUID")
+
+
+def publish_all_drafts(source_infos: list[dict], console=None, *, output_dir=None) -> int:
+    """Render requested source cards without modifying persisted drafts.
+
+    The pipeline passes per-run staging. The default preserves the configured
+    vault/skills API; the standalone CLI always uses dedicated staging.
+    """
+    _, _, config = import_skillmind()
+    from skillmind.renderer import publish_to_vault
+    cfg = config.load_config()
+    destination = Path(output_dir).resolve() if output_dir is not None else config.get_vault_dir(cfg) / "skills"
+    sources = {str(s["source_hash"]): s for s in source_infos if s.get("source_hash")}
+    published = 0
+    for source_hash, source in sources.items():
+        for _, draft in _drafts_for(source_hash, config):
+            try:
+                _validate_draft(draft, source)
+                publish_to_vault(draft, cfg, output_dir=destination)
+                published += 1
+            except Exception as exc:
+                if console:
+                    console.print(f"[yellow]Draft not staged ({type(exc).__name__})[/yellow]")
+    return published
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical(draft: dict, renderer) -> str:
+    # Use SkillMind's exact publication sanitizer, retaining original status.
+    return json.dumps(renderer._published_evidence_draft(draft), sort_keys=True, ensure_ascii=False)
+
+
+def _artifact_source(path: Path, envelope: dict | None) -> str:
+    """Use both channels so damaged Markdown still enters integrity checks."""
+    if envelope and isinstance(envelope.get("draft"), dict):
+        return _source_hash(envelope["draft"])
+    import yaml
+    try:
+        text = path.read_text(encoding="utf-8")
+        if text.startswith("---\n"):
+            frontmatter = yaml.safe_load(text.split("---", 2)[1])
+            if isinstance(frontmatter, dict):
+                return str(frontmatter.get("source_hash") or "")
+    except (OSError, ValueError, yaml.YAMLError):
+        pass
     return ""
 
 
+def _verified_artifacts(source_hash: str, root: Path, drafts: list[tuple[Path, dict]], renderer, cfg: dict):
+    # Bind the actual published metadata and body to the persisted draft too.
+    # A sidecar digest can be recomputed after editing Markdown, so its hash
+    # alone cannot establish that the renderer produced the staged content.
+    expected = Counter((_canonical(draft, renderer), renderer.render_to_markdown(draft, cfg))
+                       for _, draft in drafts)
+    actual = Counter()
+    artifacts, sidecars = {}, {}
+    for path in sorted(root.rglob("*.md")):
+        sidecar = path.with_suffix(".evidence.json")
+        try:
+            envelope = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            envelope = None
+        side_hash = _artifact_source(path, envelope if isinstance(envelope, dict) else None)
+        markdown_hash = _artifact_source(path, None)
+        if source_hash not in (side_hash, markdown_hash):
+            continue
+        if not path.resolve().is_relative_to(root.resolve()) or path.is_symlink() or sidecar.is_symlink():
+            raise ValueError("Staged evidence must be regular files within staging")
+        verified = renderer.load_artifact_evidence(path)
+        if _source_hash(verified["draft"]) != source_hash or markdown_hash != source_hash:
+            raise ValueError("Staged artifact source identity differs from canonical draft")
+        # The sidecar is already the renderer's canonical published snapshot.
+        # Re-sanitizing it would conceal fields inserted after publication.
+        actual[(json.dumps(verified["draft"], sort_keys=True, ensure_ascii=False),
+                path.read_text(encoding="utf-8"))] += 1
+        artifacts[str(path.resolve())] = _sha(path)
+        sidecars[str(sidecar.resolve())] = _sha(sidecar)
+    if expected != actual:
+        missing = sum((expected - actual).values())
+        extra = sum((actual - expected).values())
+        raise ValueError(f"Staged evidence differs from persisted drafts: missing={missing}, extra/substituted={extra}")
+    if not artifacts:
+        raise ValueError("No verified staged artifacts for source")
+    return artifacts, sidecars
+
+
+def _details(report) -> dict:
+    if hasattr(report, "to_detailed_dict"):
+        return report.to_detailed_dict()
+    if is_dataclass(report):
+        return asdict(report)
+    return {key: value for key, value in vars(report).items() if not callable(value)}
+
+
+def _reason_notes(value) -> list[str]:
+    reasons = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"reason", "description", "notes"} and isinstance(item, str) and item:
+                reasons.append(item)
+            elif key in {"integrity_errors", "evaluation_errors"} and isinstance(item, list):
+                reasons.extend(str(error) for error in item)
+            else:
+                reasons.extend(_reason_notes(item))
+    elif isinstance(value, list):
+        for item in value:
+            reasons.extend(_reason_notes(item))
+    return list(dict.fromkeys(reasons))
+
+
+def audit_one(source_info: dict, role: str, *, vault_skills=None) -> AuditResult:
+    """Require exact source/card/artifact correspondence before approval."""
+    result = AuditResult(source_info.get("source_hash", ""), "", role)
+    try:
+        ensure_skillmind_venv()
+        _, _, config = import_skillmind()
+        import skillmind.auditor as auditor
+        import skillmind.renderer as renderer
+        cfg = config.load_config()
+        source_hash = result.source_hash
+        if not source_hash:
+            raise ValueError("Missing source hash")
+        raw = Path(source_info["raw_path"])
+        if not raw.is_file():
+            raise ValueError("Source raw file is unavailable")
+        raw_hash = _sha(raw)
+        if raw_hash != source_hash:
+            raise ValueError("Raw source bytes do not match the cached source hash")
+        root = Path(vault_skills).resolve() if vault_skills is not None else config.get_vault_dir(cfg) / "skills"
+        drafts = _drafts_for(source_hash, config)
+        result.draft_paths = [str(path) for path, _ in drafts]
+        result.draft_path = result.draft_paths[0] if result.draft_paths else ""
+        result.draft_sha256 = {str(path): _sha(path) for path, _ in drafts}
+        if not drafts:
+            raise ValueError("No persisted source drafts")
+        for _, draft in drafts:
+            _validate_draft(draft, source_info)
+        schemas = {draft.get("schema_version", "") for _, draft in drafts}
+        if len(schemas) != 1:
+            raise ValueError("Source drafts mix incompatible schemas")
+        result.schema_version = schemas.pop()
+        artifacts, sidecars = _verified_artifacts(source_hash, root, drafts, renderer, cfg)
+        result.artifact_paths = list(artifacts)
+        result.artifact_sha256 = artifacts
+        result.audit_details = {"staging_sidecar_sha256": sidecars, "source_sha256": raw_hash}
+        report = auditor.audit_source(source_hash, cfg=cfg, console=None,
+                                      max_extract_files=len(artifacts),
+                                      vault_skills_override=str(root))
+        result.audit_details.update(_details(report))
+        result.audit_details["staging_sidecar_sha256"] = sidecars
+        result.audit_details["source_sha256"] = raw_hash
+        result.audit_prompt_version = getattr(report, "prompt_version", "")
+        result.missing = getattr(report, "missing", [])
+        result.notes = _reason_notes(result.audit_details)
+        after = _drafts_for(source_hash, config)
+        if {str(path): _sha(path) for path, _ in after} != result.draft_sha256:
+            raise ValueError("Persisted drafts changed during audit")
+        after_artifacts, after_sidecars = _verified_artifacts(source_hash, root, after, renderer, cfg)
+        if after_artifacts != artifacts or after_sidecars != sidecars or _sha(raw) != raw_hash:
+            raise ValueError("Source or staged artifacts changed during audit")
+        files = getattr(report, "extract_files", None)
+        if not isinstance(files, list) or not all(isinstance(path, str) for path in files):
+            raise ValueError("Audit report lacks a valid artifact list")
+        reported = [str(Path(path).resolve()) for path in files]
+        if Counter(reported) != Counter(artifacts.keys()):
+            raise ValueError("Audit report artifact set is missing, extra or substituted")
+        if getattr(report, "source_hash", None) != source_hash:
+            raise ValueError("Audit report belongs to a different source")
+        verdict = getattr(report, "verdict", None)
+        review = getattr(report, "needs_human_review", None)
+        if verdict not in STATUSES or type(review) is not bool:
+            raise ValueError("Malformed audit verdict or review flag")
+        if (verdict == "PASS") != (review is False):
+            raise ValueError("Audit verdict and review flag are inconsistent")
+        if not isinstance(result.missing, list):
+            raise ValueError("Malformed missing-source report")
+        coverage = getattr(report, "coverage_weighted", None)
+        # SkillMind's API documents this display quantity on a 0–100 percent scale.
+        if coverage is not None and (type(coverage) not in (float, int) or not math.isfinite(coverage) or not 0 <= coverage <= 100):
+            raise ValueError("Malformed display coverage")
+        result.coverage = coverage
+        hallucinations = getattr(report, "hallucinations", [])
+        items = getattr(report, "items", [])
+        if not isinstance(hallucinations, list) or not isinstance(items, list):
+            raise ValueError("Malformed audit item lists")
+        result.hallucination_rate = len(hallucinations) / max(len(items), 1)
+        if result.schema_version == SEMANTIC_SCHEMA:
+            for name in DIMENSIONS:
+                status = getattr(report, name, None)
+                if status not in STATUSES:
+                    raise ValueError(f"Malformed semantic dimension: {name}")
+                setattr(result, name, status)
+            if result.audit_details.get("integrity_errors"):
+                raise ValueError("Semantic audit contains integrity errors")
+            proven_failure = verdict == "FAIL" and any(getattr(result, name) == "FAIL" for name in DIMENSIONS)
+            if result.audit_details.get("evaluation_errors") and not proven_failure:
+                raise ValueError("Semantic audit contains unresolved evaluation errors")
+            if verdict == "PASS" and (not all(getattr(result, name) == "PASS" for name in DIMENSIONS) or result.missing):
+                raise ValueError("Semantic PASS lacks complete passing dimensions")
+        result.verdict = verdict
+        result.needs_human_review = review
+    except Exception as exc:
+        result.verdict = "UNKNOWN"
+        result.needs_human_review = True
+        # Provider/IO exceptions may echo credentials, so only controlled local reasons are copied.
+        reason = str(exc) if isinstance(exc, ValueError) else f"Audit failed ({type(exc).__name__})"
+        result.notes.append(reason)
+        result.audit_details.setdefault("adapter_errors", []).append(reason)
+    return result
+
+
+def _find_draft_path(source_hash: str) -> str:
+    _, _, config = import_skillmind()
+    drafts = _drafts_for(source_hash, config)
+    return str(drafts[0][0]) if drafts else ""
+
+
 def write_audit_results(results: list[AuditResult]) -> None:
-    """按 verdict 分文件写。对齐 skillMind 新判定:
-       - PASS(≥90%) → approved.jsonl(自动放行)
-       - FAIL(<90%) → manual-review.jsonl(需人工)
-       - rejected.jsonl 保留以备硬错误(本版暂未用,空文件)
-    """
-    for fp in (APPROVED_FILE, REVIEW_FILE, REJECT_FILE):
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        if fp.exists():
-            fp.unlink()
-    approved = [r for r in results if r.verdict == "PASS"]
-    review = [r for r in results if r.verdict == "FAIL"]
-    rejected: list[AuditResult] = []   # 新判定无 rejected,留空 list
-    for fp, items in ((APPROVED_FILE, approved), (REVIEW_FILE, review), (REJECT_FILE, rejected)):
-        with fp.open("w", encoding="utf-8") as f:
-            for r in items:
-                f.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
+    """Every source is retained; explicit approvals alone enter approved.jsonl."""
+    approved = [result for result in results if result.is_approved]
+    review = [result for result in results if not result.is_approved]
+    for path, items in ((common.APPROVED_FILE, approved), (common.REVIEW_FILE, review), (common.REJECT_FILE, [])):
+        common.atomic_write_text(path, "".join(json.dumps(item.to_dict(), ensure_ascii=False) + "\n" for item in items))
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def _infer_role_from_source(source: dict) -> str:
+    role = source.get("target_role")
+    if role and role != "auto":
+        return role
+    return common.detect_role_from_text((source.get("url") or source.get("source_url") or "") + " " + (source.get("notes") or "")) or "后端工程师"
+
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
     from rich.console import Console
-
-    parser = argparse.ArgumentParser(description="阶段 2+3: extract + publish + audit (v3)")
-    parser.add_argument("--config", required=True, help="sources.yaml 路径")
-    parser.add_argument("--role", help="target_role override")
-    parser.add_argument("--skip-extract", action="store_true", help="跳过 extract,直接用 drafts/ 已存在草稿")
-    parser.add_argument("--skip-publish", action="store_true", help="跳过阶段 2.5 publish(已发布过)")
-    args = parser.parse_args(argv)
-
-    console = Console()
     import yaml
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
-    sources = cfg.get("sources", [])
-
-    # 1. ingest
-    if not args.skip_extract:
-        from skillmind.collector import list_cached
-        _, _, config_mod = import_skillmind()
-        cached = list_cached()
-        source_infos: list[dict] = []
-        for src in sources:
-            target = src.get("url") or src.get("path", "")
-            for c in cached:
-                if c.get("source_url") == target or c.get("source_repo") == target:
-                    source_infos.append(c)
-                    break
-        console.print(f"[bold]阶段 1+2: 找到 {len(source_infos)} 个已采集源,开始 extract[/bold]")
-        extract_results = extract_batch(source_infos, console=console)
+    from source_types import is_github_skill_url, skill_collector_url
+    parser = argparse.ArgumentParser(description="Scoped extract, stage and audit")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--role")
+    parser.add_argument("--skip-extract", action="store_true")
+    parser.add_argument("--skip-publish", action="store_true", help="Audit configured skills with strict evidence checks")
+    args = parser.parse_args(argv)
+    console = Console()
+    config_data = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+    collector, _, config = import_skillmind()
+    cached = collector.list_cached()
+    source_infos, unresolved = [], []
+    for source in config_data.get("sources", []):
+        target = source.get("url") or source.get("path", "")
+        aliases = {target}
+        if is_github_skill_url(target):
+            aliases.add(skill_collector_url(target))
+        matches = [entry for entry in cached if target and aliases.intersection(
+                   (entry.get("source_url"), entry.get("source_repo"), entry.get("raw_path")))]
+        if not matches:
+            unresolved.append(AuditResult("", "", args.role or _infer_role_from_source(source),
+                                          notes=["Configured source has no cached match"]))
+        for match in matches:
+            info = dict(match)
+            for field in ("target_role", "notes", "url"):
+                if field in source:
+                    info[field] = source[field]
+            if not any(item.get("source_hash") == info.get("source_hash") for item in source_infos):
+                source_infos.append(info)
+    extracted = [] if args.skip_extract else extract_batch(source_infos, console=console)
+    failures = {item["source"].get("source_hash"): item["error"] for item in extracted if item.get("error")}
+    results = list(unresolved)
+    if args.skip_publish:
+        stage = config.get_vault_dir(config.load_config()) / "skills"
     else:
-        extract_results = []
-        # skip-extract 时:从 list_cached() 拿所有 source_info,用于 audit
-        from skillmind.collector import list_cached
-        cached = list_cached()
-        # 转成与 extract_results 等价的 shape,便于后续 audit 循环
-        extract_results = [{"source": c, "drafts": []} for c in cached]
-        console.print(f"[bold]跳过 extract,直接 audit 已存在草稿 ({len(extract_results)} 源)[/bold]")
-
-    # 2.5 publish(必须先于 audit)
-    if not args.skip_publish:
-        console.print(f"\n[bold]━━━ 阶段 2.5: publish_to_vault ━━━[/bold]")
-        n = publish_all_drafts(console=console)
-        if n == 0 and not args.skip_extract:
-            console.print("[yellow]警告: 没有草稿被 publish,可能 drafts/ 为空[/yellow]")
-    else:
-        console.print("\n[bold yellow]━━━ 阶段 2.5: publish 跳过 ━━━[/bold yellow]")
-
-    # 3. audit(每个 source_hash 一次,不复抽)
-    console.print(f"\n[bold]━━━ 阶段 3: audit (skillMind LLM) ━━━[/bold]")
-    seen_hashes: set[str] = set()
-    audit_results: list[AuditResult] = []
-    for er in extract_results:
-        src = er["source"]
-        sh = src.get("source_hash", "")
-        if not sh or sh in seen_hashes:
-            continue
-        seen_hashes.add(sh)
-        role = args.role or _infer_role_from_source(src)
-        try:
-            ar = audit_one(src, role)
-            audit_results.append(ar)
-            # 终端 summary:对齐 skillMind 精简 JSON
-            console.print(
-                f"  coverage={ar.coverage:.1f}%  verdict={ar.verdict}  "
-                f"needs_review={ar.needs_human_review}  halluc={ar.hallucination_rate:.2f}  "
-                f"missing={len(ar.missing)}"
-            )
-            for note in ar.notes:
-                console.print(f"    [yellow]note:[/yellow] {note}")
-        except Exception as e:
-            console.print(f"  [bold red]FAIL[/bold red] audit 失败 ({sh[:12]}): {e}")
-
-    write_audit_results(audit_results)
-    n_pass = sum(1 for r in audit_results if r.verdict == "PASS")
-    n_fail = sum(1 for r in audit_results if r.verdict == "FAIL")
-    console.print(
-        f"\n[bold green]完成[/bold green] PASS={n_pass} "
-        f"FAIL={n_fail} / 总源 {len(audit_results)}"
-    )
-    return 0
-
-
-def _infer_role_from_source(source: dict) -> str:
-    """从 sources.yaml 推断角色:优先 target_role,否则用源 url/text 关键词。"""
-    tr = source.get("target_role")
-    if tr and tr != "auto":
-        return tr
-    text = (source.get("url") or "") + " " + (source.get("notes") or "")
-    from _common import detect_role_from_text
-    role = detect_role_from_text(text)
-    return role or "后端工程师"
+        # Retain hashed evidence for later review and routing; never stage in the vault.
+        stage_parent = common.AUDIT_DIR / "staging"
+        stage_parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix="run-", dir=stage_parent))
+        publish_all_drafts([info for info in source_infos if info.get("source_hash") not in failures], console=console, output_dir=stage)
+    for info in source_infos:
+        role = args.role or _infer_role_from_source(info)
+        error = failures.get(info.get("source_hash"))
+        result = AuditResult(info.get("source_hash", ""), "", role, notes=[error]) if error else audit_one(info, role, vault_skills=stage)
+        results.append(result)
+        console.print(f"coverage={common.format_coverage(result.coverage)} verdict={result.verdict} needs_review={result.needs_human_review}")
+    write_audit_results(results)
+    return 0 if results and all(result.is_approved for result in results) else 1
 
 
 if __name__ == "__main__":

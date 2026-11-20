@@ -1,361 +1,73 @@
-# se-skill-distill 使用说明
+# se-skill-distill
 
-> **基于 skillMind 的 SE 域知识蒸馏流水线**
-> 从 SKILL.md / 博客 / 论坛等源抽取结构化知识 → 通过 audit 质量校验 → 路由到角色子目录 → 注入 Obsidian 风格 vault,顺带自动改角色基因 frontmatter。
+将 SkillMind 提炼的知识路由到角色技能目录，供引擎按技能自身的 trigger 动态召回。0.2.0 适配 SkillMind v2.5 的语义提炼、三态审计和哈希绑定证据；此仓负责编排和格式适配，提炼与语义判断由 SkillMind 完成。
 
----
+## 运行准备
 
-## 安装(npm 全局,推荐)
+使用已安装 SkillMind v2.5 的 Python 环境。npm 分发只复制文件，不会安装 Python 依赖或激活虚拟环境。
 
-```bash
-npm install -g @wesson88/se-skill-distill
-# postinstall 自动复制 skill 到 ~/.claude/skills/se-skill-distill/
-
-# 使用前配置(全局安装后 vault 无法从 skill 位置自动推导):
-export SE_VAULT=<你的 vault 根>            # 必需
-# skillmind 前置:pip install skillmind,或 export SKILLMIND_REPO=<本地 skillMind 仓库>
-
-# 验证(应输出 preflight 通过):
-python ~/.claude/skills/se-skill-distill/scripts/preflight.py
-```
-
-skill 启动时(pipeline.py / distill_url.py)会自动 preflight 检查 vault + skillmind,不就绪会逐条给修复指引。
-
-> 也可从源码跑:`python pipeline.py --config sources.yaml`(需在 skill 目录,Python 能 import skillmind)。
-
----
-
-## 使用流程(端到端)
-
-**1. 安装 + 配置**(一次性,详见上节「安装」)
-```bash
-npm install -g @wesson88/se-skill-distill
-export SE_VAULT=<你的 vault 根>
-python ~/.claude/skills/se-skill-distill/scripts/preflight.py   # 验证 vault + skillmind 两项 ✓
-```
-
-**2. 蒸馏一个源**(最常见入口)
-```bash
-# 命令行一键蒸馏 GitHub URL(自动 ingest → extract → publish → audit → route → inject):
-python ~/.claude/skills/se-skill-distill/scripts/distill_url.py https://github.com/owner/repo --role 后端工程师
-```
-或在 Claude Code 里直接说「把这个 README 蒸馏到 vault」,skill 自动触发。
-
-**3. 看结果**(skill 目录的 `_state/` + vault)
-- `_state/audit/approved.jsonl` — coverage ≥ 90% 自动入 vault 的源
-- `_state/audit/manual-review.jsonl` — coverage < 90%,需人工 review `missing[]`
-- vault `20-知识/角色技能/se/<role>/B<n>-<title>.md` — 注入的 skill 文件
-- `00-系统/角色基因/se/角色-<role>.md` — frontmatter 自动追加 `skill_refs`
-
-**4. 批量蒸馏**(可选)
-编辑 `sources.yaml` 加多个源,跑 `python ~/.claude/skills/se-skill-distill/scripts/pipeline.py --config <sources.yaml 路径>`。
-
-> skill 每次启动会自动 preflight:vault/skillmind 不就绪会逐条给修复指引并退出,不会跑到一半才崩。
-
----
-
-## 0. 怎么触发(30 秒上手)
-
-```bash
-# 1) 编辑 sources.yaml(列出要蒸馏的源)
-# 2) 跑流水线
-python pipeline.py --config sources.yaml
-```
-
-跑完后看 `_state/audit/approved.jsonl` 知道哪些源过了 audit(自动入了 vault),看 `_state/audit/manual-review.jsonl` 知道哪些需要人工 review。
-
----
-
-## 1. 这是什么 / 不是
-
-**是**:
-- skillMind 的**编排器**(包了 ingest → extract → publish → audit → route → inject 6 步)
-- 解决"抽取了但不知道质量如何"的问题
-- 让 90% 以上覆盖率的抽取**自动入 vault**,不达标才卡人工
-
-**不是**:
-- skillMind 本身的替代品(还是依赖 skillMind 跑 extract)
-- 全自动工具(audit FAIL 时仍需人)
-- 跨平台开箱即用(代码是 Python,跨平台,但默认 vault 推导硬编码了 Windows 布局)
-
----
-
-## 2. 怎么触发(完整方式)
-
-### 2.1 触发方式
-
-| 方式 | 适用 |
-|---|---|
-| **Claude Code skill 自动发现** | 把 `se-skill-distill` 放在 `.claude/skills/`,Claude Code 自动识别(`/skill` 列表里能看到) |
-| **CLI 手动** | 直接调 `pipeline.py`,适合调试 / CI / batch |
-| **CI / scheduled** | 调 CLI,exit code 0 = 全过;非 0 = 需 review |
-
-### 2.2 CLI 完整参数
-
-```bash
-python pipeline.py --config <path> [选项]
-```
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| `--config <path>` | ✅ | `sources.yaml` 路径 |
-| `--vault <path>` | ❌ | vault 根路径(默认从脚本位置推导;也可 `SE_VAULT` env) |
-| `--dry-run` | ❌ | 不写 vault,只跑流程 |
-| `--skip-extract` | ❌ | 用 drafts/ 已存草稿,跳过 extract |
-| `--skip-publish` | ❌ | 不 publish(已发布过) |
-| `--status` | ❌ | 显示运行状态(ledger 概览) |
-
-### 2.3 跨平台命令
-
-| OS | 命令 |
-|---|---|
-| **Windows (PowerShell)** | `python pipeline.py --config sources.yaml` |
-| **Linux / macOS (bash)** | `./.venv/bin/python pipeline.py --config sources.yaml` |
-
-Windows 建议前置:
 ```powershell
-$env:PYTHONIOENCODING = "utf-8"
-chcp 65001 > $null
+$env:SE_VAULT = '<vault 根目录>'
+$env:SKILLMIND_REPO = '<SkillMind 源码目录>'  # 源码方式可设；已安装包可不设
+$env:SKILLMIND_HOME = '<SkillMind 数据目录>'  # 未设时使用默认目录
+$env:PYTHONIOENCODING = 'utf-8'
+& "$env:SKILLMIND_REPO\.venv\Scripts\Activate.ps1"
+python scripts/preflight.py
 ```
 
-Linux/macOS:
-```bash
-export PYTHONIOENCODING=utf-8
-```
+Linux/macOS 可激活同一安装环境的 `.venv/bin/activate`，环境变量含义相同。当前 Python 需具备 SkillMind 的依赖；正常入库不改写角色基因。
 
----
+前置检查验证 vault 的 `00-系统/`、`20-知识/` 及 `semantic_distillation_v1`、四维审计和证据 API。能 import 旧版 SkillMind 并不代表兼容。`--vault <path>` 可替代 `SE_VAULT`，`--help` 不要求先配置 vault。
 
-## 3. sources.yaml 写法
-
-```yaml
-sources:
-  - kind: single_url
-    url: https://raw.githubusercontent.com/Leonxlnx/taste-skill/main/skills/brandkit/SKILL.md
-    target_role: 后端工程师
-    notes: "brandkit 蒸馏测试"
-```
-
-`kind` 可选:
-- `single_url` — 任意 URL(博客/文档/单文件)
-- `github_raw` — GitHub raw 文件
-- `github_repo` — 整仓扫 SKILL.md
-- `local_dir` — 本地目录递归扫
-- `rss` — RSS feed
-
-`target_role`: 后端工程师 / 前端工程师 / 架构师 / 技术主管 / 产品经理 / **auto**(关键词推断)
-
-`notes`: 仅自用,不影响流程。
-
----
-
-## 4. vault 布局要求(必需)
-
-```
-{VAULT_ROOT}/
-├── 00-系统/
-│   ├── 角色基因/se/
-│   │   ├── 角色-后端工程师.md   ← 被 patch 加 skill_refs
-│   │   ├── 角色-前端工程师.md
-│   │   ├── 角色-架构师.md
-│   │   ├── 角色-技术主管.md
-│   │   └── 角色-产品经理.md
-│   └── 复盘记录/{date}-角色注入.md
-└── 20-知识/
-    └── 角色技能/se/
-        ├── 后端工程师/B<n>-<title>.md   ← inject 写入
-        ├── 前端工程师/
-        ├── 架构师/
-        ├── 技术主管/
-        └── 产品经理/
-```
-
-`00-系统/角色基因/se/角色-<role>.md` 和 `20-知识/角色技能/se/` **都必需存在**。缺一个直接报错,提示用 `--vault`。
-
-**vault 根路径解析顺序**(优先级高→低):
-1. `--vault` CLI 参数
-2. `SE_VAULT` 环境变量
-3. 从脚本位置推导(`<vault>/.claude/skills/se-skill-distill/scripts` → 上 3 层 = `<vault>`)
-
----
-
-## 5. 6 阶段流水线详解
-
-| # | 阶段 | 做什么 | 跳过? |
-|---|---|---|---|
-| 1 | **ingest** | 调 `skillmind.ingest` 抓源到 `~/.skillmind/cache/raw/` | `--skip-extract`? NO(必要)|
-| 2 | **extract** | 调 `skillmind.extractor.extract_skill` 抽草稿(LLM)到 `~/.skillmind/drafts/` | `--skip-extract` YES |
-| 2.5 | **publish** | 调 `skillmind publish --all` 把 drafts 写进 vault | `--skip-publish` YES |
-| 3 | **audit** | 调 `skillmind.auditor.audit_source` 算 coverage | NO(关键)|
-| 4 | **route** | 按 role 选子目录,生成 `B<n>-<title>.md` 文件名 | NO(若 audit FAIL 则整体跳过)|
-| 5 | **inject** | 写 skill 文件 + patch 角色基因 frontmatter + 落 ledger | NO |
-
-**audit 判定**(stage 3 输出):
-
-| coverage | verdict | needs_human_review | 后续 |
-|---|---|---|---|
-| ≥ 90% | `PASS` | `false` | 自动进 stage 4-5 |
-| < 90% | `FAIL` | `true` | 停在该源,等人工 review `missing[]` |
-
----
-
-## 6. 输出解读
-
-跑完一次典型输出:
-
-```
-vault 根:<vault>
-=== skillmind-to-vault 蒸馏流水线 ===
-源数: 1
-
-━━━ 阶段 3: audit (skillMind LLM, 90% 阈值) ━━━
-  coverage=98.2%  verdict=PASS  needs_review=False  halluc=0  missing=0
-
-  PASS=1  FAIL=0  / 总源 1
-
-━━━ 阶段 4: route ━━━
-  98.2%  后端工程师  B15-Brandkit Ima.md
-  routed=1 unknown=0
-
-━━━ 阶段 5: inject ━━━
-  ✓ B15-Brandkit Ima.md → 后端工程师
-
-=== 完成 ===  injected=1  failed=0
-```
-
-**落盘位置**:
-- `_state/audit/approved.jsonl` — 自动通过的源
-- `_state/audit/manual-review.jsonl` — FAIL,需人工
-- `_state/audit/rejects.jsonl` — 硬错误(本版基本空)
-- `_state/injection_ledger.jsonl` — 每次 inject 的原子记录
-- `_state/routed.jsonl` — 路由结果
-- `_state/unknown-queue.md` — role 无法判定的源
-
----
-
-## 7. 失败处理流程
-
-### 7.1 audit FAIL(coverage < 90%)
+## 单个来源与批量运行
 
 ```bash
-# 1. 看哪些源 FAIL
-cat _state/audit/manual-review.jsonl
-
-# 2. 看具体缺什么(missing[] 每条含 section/statement/reason)
-cat _state/audit/manual-review.jsonl | python -m json.tool
-
-# 3. 修 extract prompt 或补抽,然后清缓存重跑
-rm ~/.skillmind/cache/extract_cache/<source_hash>_extract_v9.json
-python pipeline.py --config sources.yaml
+python scripts/distill_url.py https://github.com/obra/superpowers/blob/main/skills/writing-plans/SKILL.md --role 技术主管
+python scripts/pipeline.py --config sources.yaml --vault <vault根目录>
+python scripts/pipeline.py --config sources.yaml --skip-extract
+python scripts/pipeline.py --config sources.yaml --dry-run
+python scripts/pipeline.py --status
 ```
 
-### 7.2 inject partial 失败
+`--skip-extract` 复用当前来源的已存草稿，仍会审计。`--dry-run` 仍会采集、提取和审计，可能调用模型并写入缓存/隔离暂存；它不写最终角色技能或角色基因。没有离线回放数据时不要把这两个选项当作免费运行。
 
-`04_inject.py` 出错时自动回滚(基于 `injection_ledger.jsonl` 记录)。无需手动干预。
+GitHub `SKILL.md` / `*.skill.md` 的 blob、raw 链接走 Skill 采集，保留指定 revision；raw 会归一化为 SkillMind v2.5 支持的 blob 下载入口。普通 README、博客仍按文档类型处理，不会自动伪装成 Skill。来源配置见 [source-schema.md](references/source-schema.md)。
 
-### 7.3 角色无法判定
+## 流程与准入
 
-写入 `_state/unknown-queue.md`,跳过该条。手动在 sources.yaml 显式设 `target_role` 重跑。
+采集 → 提取 → 当前批次隔离发布 → 审计 → 角色路由 → 技能及证据入库。
 
----
+- 仅发布本次请求来源的草稿到独立审计暂存目录，不运行全局 `publish --all`，不依赖 PATH 中另一个 `skillmind`。
+- 审计绑定全部来源草稿、暂存产物及报告中的文件集合。缺卡、证据不符、文件被改写或审计不完整均不能放行；多卡片来源全部保留。
+- `PASS` 且无需人工复核才有入库资格；新语义 Skill 还必须具有覆盖、来源支持、知识重组、原文台账四维 PASS。覆盖百分比只展示，不在本层计算放行阈值。
+- `FAIL` 与 `UNKNOWN` 均保存到人工复核队列。覆盖率允许为未测；满覆盖仍可能因杜撰或缺乏提炼而 FAIL。具体原因、四维状态与详细报告保留。
+- 入库前重新核对草稿与审计快照。最终正文保留 `distillation.sections` 的标题与内容，外层只添加角色 frontmatter 和引用，不再次提炼或拆回旧槽位。
+- 最终 Markdown 与邻接 `.evidence.json` 绑定新的实际文件哈希；不能复用暂存文件的旧哈希。证据随入库、回滚处理，保留外部编辑或非本工具拥有的文件。
+- 遵守当前 vault 角色基因规范 §10：技能目录与 `trigger` 是唯一召回依据，不新增 `skill_refs` / `rule_refs`、不改写或创建角色基因。触发词取自已审元信息；按 §10.4 至少有一个在本角色目录独有的关键词，重复冲突进入复核，不编造新词或用角色名兜底。更新自己的文件不算关键词冲突。
 
-## 8. 推荐工作流(批量)
+普通非 Skill 文档保留旧正文渲染，由当前 SkillMind 返回其审计 verdict。详细契约见 [审计说明](references/confidence-formula.md)。
 
-```bash
-# 1. 编辑 sources.yaml(加 5-10 个源)
-# 2. 干跑看预演
-python pipeline.py --config sources.yaml --dry-run
+## 状态、输出与失败
 
-# 3. 正式跑
-python pipeline.py --config sources.yaml
+默认状态位于本仓 `_state/`，可用 `SE_STATE_DIR` 改到本机私有目录。SkillMind 数据位置由其配置/API 决定，审计和草稿查找不会硬编码另一个 home。
 
-# 4. 看 audit 落盘,挑出需要修的
-cat _state/audit/manual-review.jsonl
-
-# 5. 修 extract prompt,清缓存,重跑
-rm ~/.skillmind/cache/extract_cache/<hash>_extract_v9.json
-python pipeline.py --config sources.yaml
-```
-
----
-
-## 9. 跨平台注意
-
-| 项 | 状态 |
+| 位置 | 内容 |
 |---|---|
-| Python 代码(`pathlib` 写法) | ✅ 跨平台 |
-| skillMind 依赖 | ✅ 跨平台 |
-| **默认 vault 推导** | ⚠️ 假设 `<vault>/.claude/skills/<x>/scripts/` 布局,Mac/Linux 上路径会变但仍正确 |
-| **文档示例命令** | ⚠️ 当前是 PowerShell 风格,Mac/Linux 用户需用 bash |
-| 路径分隔符 | ✅ `pathlib` 自动处理 `/` 和 `\` |
-| ruamel.yaml | ✅ 三平台都有,`pip install ruamel.yaml` |
+| `_state/audit/approved.jsonl` | 完整且批准的审计记录、草稿与暂存哈希 |
+| `_state/audit/manual-review.jsonl` | FAIL、UNKNOWN、来源/提取/证据/入库异常 |
+| `_state/runs/` | 主流水线每轮独立的审计产物 |
+| `_state/routed.jsonl` | 路由结果，携带审计快照供注入验证 |
+| `_state/injection_ledger.jsonl` | 正文与证据事务的写入/回滚记录 |
+| `<vault>/20-知识/角色技能/<domain>/<role>/` | 最终角色技能与证据 |
 
-**Mac/Linux 用户建议**:
-- 显式 `--vault <path>` 或 `export SE_VAULT=<path>`,不依赖推导
-- 跑前 `export PYTHONIOENCODING=utf-8`(Python 3.7+ 默认 UTF-8,可不设)
+只要有来源未成功通过或入库，流水线就返回非零；不能把“没有 PASS”当作成功。关键词无法确定角色时需人工指定 `--role` / `target_role`。角色目录使用既有前缀与编号，参见 [命名规则](references/naming-rules.md)。
 
----
+回滚命令与边界见 [rollback-runbook.md](references/rollback-runbook.md)。修改已生成的 Markdown 会使证据失效，审阅后应从规范草稿重新生成。
 
-## 10. FAQ
-
-**Q: `skillmind` 命令找不到**
-A: 用 `python -m skillmind` 代替,或加 `~/.local/bin`(pip 安装路径)到 PATH。
-
-**Q: 报"VAULT_ROOT 无效"**
-A: vault 必须同时有 `00-系统/` 和 `20-知识/` 子目录。用 `--vault <path>` 或 `SE_VAULT=<path>` 显式指定。
-
-**Q: 报"找不到 source_hash"**
-A: 源没在 `~/.skillmind/hashes.yaml`。先跑 `python -m skillmind ingest <url>` 一次,再跑 pipeline。
-
-**Q: audit 报覆盖率 N%(N<90),missing 里写的 reason 看不懂**
-A: 把 missing 列表给 LLM,问 "这个 reason 说的缺什么 extract 怎么改",或者直接 `python -m skillmind extract <source>` 重抽。
-
-**Q: 想用不同模型做 audit(交叉验证)**
-A: 在 `~/.skillmind/config.yaml` 设 `llm_profiles.audit.model`,如:
-```yaml
-llm_profiles:
-  extract: {model: deepseek/deepseek-chat}
-  audit:   {model: anthropic/claude-3-5-haiku}
-```
-
-**Q: inject 报"角色基因文件不存在"**
-A: 缺 `00-系统/角色基因/se/角色-<role>.md`。创建该文件(参考 references/naming-rules.md)。
-
----
-
-## 11. 相关文件
-
-- `references/confidence-formula.md` — audit 判定规则(90% 阈值 + PASS/FAIL)
-- `references/naming-rules.md` — `B<n>-<title>.md` 命名规则
-- `references/rollback-runbook.md` — 失败回滚流程
-- `references/source-schema.md` — sources.yaml schema
-- `tests/test_e2e_smoke.py` — 端到端 smoke test
-- `_state/audit/` — audit 落盘(PASS/FAIL/reject 分文件)
-- `_state/injection_ledger.jsonl` — 注入原子记录(05_rollback 依据)
-
----
-
-## 12. 完整命令速查
+## 本地验证
 
 ```bash
-# 跑
-python pipeline.py --config sources.yaml
-
-# 干跑
-python pipeline.py --config sources.yaml --dry-run
-
-# 跳过 extract
-python pipeline.py --config sources.yaml --skip-extract
-
-# 跳过 publish
-python pipeline.py --config sources.yaml --skip-publish
-
-# 显式 vault
-python pipeline.py --config sources.yaml --vault "D:\my-vault"
-
-# 状态
-python pipeline.py --status
-
-# 跨平台
-# Windows:    python pipeline.py ...
-# Linux/mac:  .venv/bin/python pipeline.py ...
+python -m pytest tests -q
 ```
+
+回归使用隔离 vault、数据和状态，模型边界替换为离线响应，不需要密钥。历史手动端到端脚本 `tests/test_e2e_smoke.py` 的 main 会运行配置来源并写 vault，不属于离线 pytest 回归；不要将它当作无副作用检查。

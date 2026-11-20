@@ -8,7 +8,7 @@ sources:
     url: <string>         # 必填(kind ∈ {github_repo, github_raw, rss, single_url})
     path: <string>        # 必填(kind = local_dir)
     target_role: <enum>   # 必填,见下表
-    max_docs: <int>       # 可选,默认 50,只对 rss 生效
+    max_docs: <int>       # 可选，RSS 限流；未设继承现有采集器默认 50
     notes: <string>       # 可选,仅团队沟通用
 ```
 
@@ -19,10 +19,10 @@ sources:
 | `github_repo` | clone 仓库(深度 1)→ 递归扫 SKILL.md/CLAUDE.md/AGENTS.md 等 | `ingest_skill(url)` |
 | `github_raw` | 单文件直下载(GitHub raw URL),不克隆 | `ingest_skill(url)` (内部检测到 blob URL 自动转 raw) |
 | `rss` | 解析 RSS/Atom Feed → 抓每条 → 缓存 | `ingest_rss(url, max_items=max_docs)` |
-| `single_url` | 单篇文章/博客 URL → 抓取 + 清洗 → 缓存 | `ingest_url(url)` |
+| `single_url` | 普通文章/README 按文档采集；GitHub Skill 文件识别后走 Skill | `ingest_url(url)` 或 `ingest_skill(blob_url)` |
 | `local_dir` | 本地目录 → 递归扫 SKILL.md 等 | `ingest_skill(path)` (本地模式) |
 
-**注**:`github_raw` 与 `github_repo` 实际都调 `ingest_skill`,区别是 `github_raw` 走 `_ingest_single_raw_url` 快速路径(不克隆整个仓库)。
+**注**：`github_raw` 与 `github_repo` 实际都调 `ingest_skill`。单文件 raw URL 先归一化为 GitHub blob URL，才能触发 SkillMind v2.5 的直接下载路径；revision 保持不变。自动识别范围封闭为 GitHub 的 `SKILL.md` / `*.skill.md` 文件名。普通 README 应使用 `single_url`。
 
 ## target_role 字段
 
@@ -40,7 +40,7 @@ sources:
 ```yaml
 # 1. GitHub raw 文件(单文件,推荐 smoke test)
 - kind: github_raw
-  url: https://raw.githubusercontent.com/tiangolo/fastapi/master/README.md
+  url: "https://raw.githubusercontent.com/obra/superpowers/main/skills/writing-plans/SKILL.md"
 
 # 2. GitHub 仓库(整库扫 SKILL.md)
 - kind: github_repo

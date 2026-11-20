@@ -7,7 +7,7 @@
 # 字段说明:
 #   kind: 源类型
 #         - github_repo   : Git 仓库 URL(含子目录, 自动 clone + scan SKILL.md/CLAUDE.md 等)
-#         - github_raw    : GitHub raw 文件 URL(如 README), 单文件直下载
+#         - github_raw    : GitHub 单文件 Skill URL，归一化为 blob 后直下载
 #         - rss           : RSS / Atom Feed URL
 #         - single_url    : 单篇文章 / 博客 URL
 #         - local_dir     : 本地目录(递归扫 SKILL.md)

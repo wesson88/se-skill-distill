@@ -20,6 +20,7 @@ if sys.platform == "win32":
         pass
 
 from _common import ensure_skillmind_venv, import_skillmind, SKILLMIND_ROOT
+from source_types import is_github_skill_url, skill_collector_url
 
 
 def ingest_one(source: dict, console=None) -> list[dict]:
@@ -38,14 +39,17 @@ def ingest_one(source: dict, console=None) -> list[dict]:
 
     if kind in ("github_repo", "github_raw"):
         target = source["url"]
-        results = collector.ingest_skill(target, console=console)
+        results = collector.ingest_skill(skill_collector_url(target), console=console)
     elif kind == "rss":
         target = source["url"]
         max_items = int(source.get("max_docs", 50))
         results = collector.ingest_rss(target, console=console, max_items=max_items)
     elif kind == "single_url":
         target = source["url"]
-        results = collector.ingest_url(target, console=console)
+        if is_github_skill_url(target):
+            results = collector.ingest_skill(skill_collector_url(target), console=console)
+        else:
+            results = collector.ingest_url(target, console=console)
     elif kind == "local_dir":
         target = source["path"]
         # local_dir 走 ingest_skill 的本地模式
@@ -100,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     console.print(
         f"[bold green]完成[/bold green] 新增 {total_new} / 跳过 {total_skip} / 总源 {len(results)}"
     )
-    return 0
+    return 0 if results and all(docs for _, docs in results) else 1
 
 
 if __name__ == "__main__":

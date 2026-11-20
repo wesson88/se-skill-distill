@@ -1,105 +1,29 @@
-# 回滚 Runbook
+# 入库事务与回滚（0.2）
 
-## 何时触发
+每次 `inject_one` 将角色 Markdown 与邻接 `.evidence.json` 视为同一操作。写入失败时尝试恢复操作前状态；成功后记录 `publication_committed`。当前 vault 由目录与 trigger 动态召回，正常入库不改写或创建角色基因。所有路径必须位于选定 vault 内，已有文件的覆写须有本工具的 ledger 所有权和匹配哈希。
 
-| 场景 | 触发方式 | 范围 |
-|---|---|---|
-| 阶段 4 partial 失败(写 vault 文件 / 改 frontmatter 部分成功) | **自动** — 5 阶段之间检测 | 全部已写 vault 文件 + 已改 frontmatter |
-| 用户主动撤销上一次运行 | `python 05_rollback.py --run-id <id>` | 同上 |
-| 跑前想撤销某次 | `python 05_rollback.py --run-id <id>` | 同上 |
-| 系统级崩溃(partial 数据损坏) | 手动,见下方 | 配合 .bak 恢复 |
+## 查看与撤销
 
-## Ledger 文件
-
-`scripts/_state/injection_ledger.jsonl`,每行一条 JSON:
-
-```json
-{
-  "run_id": "2026-07-02T10:23:11",
-  "ts": "2026-07-02T10:23:11.234Z",
-  "action": "skill_file_copied" | "frontmatter_patched" | "frontmatter_restored",
-  "relpath": "20-知识/角色技能/se/后端工程师/B8-xxx.md",
-  "expected_diff": "...",
-  "status": "ok" | "failed"
-}
-```
-
-回滚时按时间倒序读 ledger,逐条 revert。
-
-## 自动回滚流程
-
-```
-阶段 4 partial 失败
-  ↓
-读 ledger
-  ↓
-对每个 status=ok 的 frontmatter_patched:
-  - shutil.copy2({relpath}.bak, {relpath})  # 从 .bak 恢复
-  - 在 ledger 写 frontmatter_restored
-  ↓
-对每个 status=ok 的 skill_file_copied:
-  - os.remove(relpath)
-  - 在 ledger 写 skill_file_removed
-  ↓
-回滚完成后:
-  - 退出码 != 0,console 提示"已自动回滚,详见 _state/injection_ledger.jsonl"
-```
-
-## 手动回滚(用户主动撤销)
+先使用与入库时一致的 Python、`SE_VAULT`、`SE_STATE_DIR`，再运行：
 
 ```bash
-# 查看最近运行
-python scripts/pipeline.py --status
-
-# 撤销指定 run_id
-python scripts/05_rollback.py --run-id 2026-07-02T10:23:11
+python scripts/05_rollback.py --list
+python scripts/05_rollback.py --run-id <操作ID> --dry-run
+python scripts/05_rollback.py --run-id <操作ID>
 ```
 
-## 系统崩溃后手动恢复
+不传 `--run-id` 时选择最近一个未回滚操作。操作使用唯一 ID，不能凭相同秒的时间戳将多个操作混为一组。一个流水线批次可能含多个入库操作，应按操作 ID 选择；反向更新旧文件时按最新操作向前撤销。
 
-如果 ledger 损坏或 .bak 丢失,按以下步骤恢复:
+## 账本与恢复依据
 
-### 1. 找最近一次的 .bak 文件
+默认账本为 `_state/injection_ledger.jsonl`，可通过 `SE_STATE_DIR` 移到本机私有状态目录。`publication_committed` 包含：
 
-```bash
-# 列出所有 .bak(按修改时间倒序)
-ls -lt 00-系统/角色基因/se/*.bak
-```
+- `run_id` / `operation_id`、角色、UUID、相对文件路径。
+- 最终 Markdown 与证据文件的哈希。
+- `files` 中各成员的操作前内容快照及前后哈希；原本不存在的文件记录空的前状态。
 
-### 2. 选最新 .bak 之前的 .md 看哪个版本是"已知好的"
+状态快照可能含私有角色内容，只保存在本机，默认状态目录被 git 忽略。不要手工改写账本来绕过验证。
 
-```bash
-git log --oneline -- 00-系统/角色基因/se/角色-后端工程师.md
-```
+回滚先验证所有成员的当前字节仍匹配操作后的哈希，再恢复原内容或移除本次新建文件。正文与证据一起处理；记录 `publication_rolled_back` 后不重复撤销。若文件被手工修改、移走、缺少恢复依据或路径越界，会拒绝自动覆盖/删除，保留人工核对。
 
-### 3. 用 git 还原
-
-```bash
-# 还原角色基因
-git restore 00-系统/角色基因/se/角色-后端工程师.md
-
-# 还原新写的 skill 文件(从 .bak 找 backup)
-# 如果 .bak 没有 skill 文件副本(本 skill 只 backup 角色基因),用 git:
-git status 20-知识/角色技能/se/后端工程师/
-# 找到本轮新加的 .md 文件,git restore 删除
-```
-
-### 4. 清理 .bak
-
-```bash
-# 恢复成功后,删 .bak
-rm 00-系统/角色基因/se/角色-后端工程师.md.bak
-```
-
-## 保留策略
-
-- `.bak` 文件保留 30 天
-- `injection_ledger.jsonl` 保留 90 天
-- 过期后由 `scripts/_state/cleanup.py` 兜底(未实现,人工清理)
-
-## 失败时不要做的事
-
-❌ **不要**直接 `rm 角色-{X}.md` 然后重新写 — 会丢 .bak 之前的版本控制历史
-❌ **不要**改 `injection_ledger.jsonl` — 是 audit 凭证
-❌ **不要**跳过回滚 — 已知 broken 状态会让下次运行雪崩
-✅ **总是**先跑 `git status` 看清楚当前状态再操作
+历史 ledger 可保留查询，但缺少所有权/前后哈希时不能安全自动恢复。旧 `.bak` 不作为无条件覆盖当前文件的授权。请从个人备份和原始记录人工核对，不要使用递归删除或复制覆盖来模拟回滚。

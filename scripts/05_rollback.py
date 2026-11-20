@@ -1,110 +1,116 @@
 """
-阶段 5: Rollback — 读 ledger,逐条 reverse
-
-回滚两种 action:
-  - frontmatter_patched → 用 .bak 恢复 + 删 .bak
-  - skill_file_copied   → 删除 vault 文件
-
-回滚顺序: 先恢复 frontmatter(破坏性大),再删 vault 文件(cheap)
+Rollback — 校验整个操作的写后哈希，再恢复 Markdown、证据和角色基因。
+独立操作 ID 避免同秒记录混淆；旧 ledger 仅支持有所有权哈希的记录。
 """
 from __future__ import annotations
 
-import json
-import shutil
+import base64
+import re
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
-from _common import LEDGER_FILE, STATE_DIR, append_ledger, read_ledger, VAULT_ROOT
+import _common as common
+from semantic_publication import (decode_prior, restore_snapshots, sha256_bytes,
+                                  sha256_file, snapshot, vault_path)
+
+
+_ACTIONS = {"publication_committed", "frontmatter_patched", "skill_file_copied"}
+
+
+def _run_id(record: dict) -> str:
+    return record.get("run_id") or record.get("ts", "")[:19]
 
 
 def list_runs() -> list[dict]:
-    """列出所有 run_id(从 ledger 时间戳聚合)。"""
-    records = read_ledger()
-    # 按 ts 分组
-    runs: dict[str, list[dict]] = {}
-    for r in records:
-        ts = r.get("ts", "")
-        # 截取到秒作为 run_id
-        run_id = ts[:19] if len(ts) >= 19 else ts
-        runs.setdefault(run_id, []).append(r)
-    return [{"run_id": k, "actions": len(v), "last_action": v[-1].get("action", "?")} for k, v in sorted(runs.items())]
+    """Use explicit transaction IDs; retain timestamp lookup for old ledgers."""
+    records = common.read_ledger()
+    rolled_back = {record.get("rollback_of_run") for record in records
+                   if record.get("action") == "publication_rolled_back"}
+    runs = {}
+    for record in records:
+        if record.get("action") not in _ACTIONS:
+            continue
+        run_id = _run_id(record)
+        if run_id not in rolled_back:
+            runs.setdefault(run_id, []).append(record)
+    return [{"run_id": key, "actions": len(values), "last_action": values[-1]["action"]}
+            for key, values in runs.items()]
+
+
+def _legacy_states(record: dict) -> list[dict]:
+    """Unbound historical entries cannot safely delete or overwrite user data."""
+    path = vault_path(record.get("relpath", ""), relative=True)
+    action = record["action"]
+    if action == "skill_file_copied":
+        expected = record.get("artifact_sha256") or record.get("after_sha256")
+        if not expected or sha256_file(path) != expected:
+            raise ValueError("Legacy skill has no matching ownership digest")
+        states = [{"relpath": record["relpath"], "before_b64": None,
+                   "before_sha256": None, "after_sha256": expected}]
+        sidecar = vault_path(path.with_suffix(".evidence.json"))
+        if sidecar.exists():
+            digest = record.get("evidence_sha256")
+            if not digest or sha256_file(sidecar) != digest:
+                raise ValueError("Legacy sidecar has no matching ownership digest")
+            states.append({"relpath": sidecar.relative_to(common.VAULT_ROOT).as_posix(),
+                           "before_b64": None, "before_sha256": None, "after_sha256": digest})
+        return states
+    expected = record.get("after_sha256")
+    if not expected or sha256_file(path) != expected:
+        raise ValueError("Legacy gene has no matching post-update digest")
+    prior_digest = record.get("before_sha256")
+    if not isinstance(prior_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", prior_digest):
+        raise ValueError("Legacy backup has no valid prior-state digest")
+    backup = vault_path(path.with_suffix(path.suffix + ".bak"))
+    data = backup.read_bytes()
+    if sha256_bytes(data) != prior_digest:
+        raise ValueError("Legacy backup digest mismatch")
+    return [{"relpath": record["relpath"], "before_b64": base64.b64encode(data).decode("ascii"),
+             "before_sha256": sha256_bytes(data), "after_sha256": expected}]
 
 
 def rollback_run(run_id: str, dry_run: bool = False) -> dict:
-    """
-    回滚指定 run_id 的所有 action。
-    顺序: frontmatter_patched(先) → skill_file_copied(后)
-    """
-    records = read_ledger()
-    target_records = [r for r in records if r.get("ts", "")[:19] == run_id]
-
-    if not target_records:
-        return {"ok": False, "error": f"找不到 run_id: {run_id}"}
-
-    # 排序: frontmatter_patched 先,skill_file_copied 后
-    priority = {"frontmatter_patched": 0, "skill_file_copied": 1}
-    target_records.sort(key=lambda r: priority.get(r.get("action", ""), 99))
-
-    restored: list[dict] = []
-    removed: list[dict] = []
-    failed: list[dict] = []
-
-    for r in target_records:
-        action = r.get("action", "")
-        relpath = r.get("relpath", "")
-        if not relpath:
-            continue
-        full = VAULT_ROOT / relpath
-
-        if action == "frontmatter_patched":
-            backup = full.with_suffix(full.suffix + ".bak")
-            if not backup.exists():
-                failed.append({"relpath": relpath, "action": action, "error": ".bak 不存在"})
-                continue
-            if dry_run:
-                restored.append({"relpath": relpath, "action": action, "from": str(backup)})
-                continue
+    """Validate every transaction member before restoring a generated pair/gene."""
+    records = common.read_ledger()
+    if any(record.get("action") == "publication_rolled_back" and record.get("rollback_of_run") == run_id
+           for record in records):
+        return {"ok": False, "error": "Run has already been rolled back"}
+    targets = [record for record in records if record.get("action") in _ACTIONS and _run_id(record) == run_id]
+    if not targets:
+        return {"ok": False, "error": "Run not found", "run_id": run_id}
+    states = []
+    try:
+        for record in reversed(targets):
+            members = record.get("files") if record["action"] == "publication_committed" else _legacy_states(record)
+            if not isinstance(members, list) or not members:
+                raise ValueError("Transaction has no recoverable file states")
+            states.extend(members)
+        seen = set()
+        for state in states:
+            path = vault_path(state["relpath"], relative=True)
+            if str(path.resolve()) in seen:
+                raise ValueError("Run contains overlapping transactions; roll back operation IDs separately")
+            seen.add(str(path.resolve()))
+            decode_prior(state)
+            if not state.get("after_sha256") or sha256_file(path) != state["after_sha256"]:
+                raise ValueError("Generated file was edited or removed; rollback refused")
+        current = [snapshot(vault_path(state["relpath"], relative=True)) for state in states]
+    except Exception as exc:
+        return {"ok": False, "run_id": run_id, "error": str(exc), "restored": [], "removed": [],
+                "failed": [{"error": str(exc)}]}
+    restored = [{"relpath": state["relpath"]} for state in states if state["before_b64"] is not None]
+    removed = [{"relpath": state["relpath"]} for state in states if state["before_b64"] is None]
+    if not dry_run:
+        try:
+            restore_snapshots(states)
+            common.append_ledger({"action": "publication_rolled_back", "status": "ok", "rollback_of_run": run_id})
+        except Exception as exc:
             try:
-                shutil.copy2(backup, full)
-                backup.unlink()
-                restored.append({"relpath": relpath, "action": action})
-                append_ledger({
-                    "action": "frontmatter_restored",
-                    "relpath": relpath,
-                    "status": "ok",
-                    "rollback_of_run": run_id,
-                })
-            except Exception as e:
-                failed.append({"relpath": relpath, "action": action, "error": str(e)})
-
-        elif action == "skill_file_copied":
-            if not full.exists():
-                failed.append({"relpath": relpath, "action": action, "error": "文件不存在"})
-                continue
-            if dry_run:
-                removed.append({"relpath": relpath, "action": action})
-                continue
-            try:
-                full.unlink()
-                removed.append({"relpath": relpath, "action": action})
-                append_ledger({
-                    "action": "skill_file_removed",
-                    "relpath": relpath,
-                    "status": "ok",
-                    "rollback_of_run": run_id,
-                })
-            except Exception as e:
-                failed.append({"relpath": relpath, "action": action, "error": str(e)})
-
-    return {
-        "ok": len(failed) == 0,
-        "run_id": run_id,
-        "restored": restored,
-        "removed": removed,
-        "failed": failed,
-    }
+                restore_snapshots(current)
+            except Exception as compensation:
+                return {"ok": False, "run_id": run_id, "error": str(exc), "rollback_error": str(compensation)}
+            return {"ok": False, "run_id": run_id, "error": str(exc)}
+    return {"ok": True, "run_id": run_id, "restored": restored, "removed": removed, "failed": []}
 
 
 def main(argv: list[str] | None = None) -> int:

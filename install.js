@@ -29,7 +29,7 @@ try {
   console.log('\n  ✅ se-skill-distill 装到 ' + DEST);
   console.log('  ⚠️  使用前请确保:');
   console.log('       ① export SE_VAULT=<你的 vault 根>');
-  console.log('       ② skillmind 可 import(pip install skillmind,或 export SKILLMIND_REPO=<本地 skillMind 仓库>)');
+  console.log('       ② 当前 Python 支持 SkillMind v2.5 语义/证据契约；源码方式可设 SKILLMIND_REPO');
   console.log('     skill 启动时 preflight 会再检查这两项并给出指引。\n');
 } catch (e) {
   console.error('  se-skill-distill postinstall:复制失败 -', e.message);
