@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import time
+from importlib.util import find_spec
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,7 +46,7 @@ def _resolve_vault_root(explicit: str | None = None) -> Path:
 
 
 # 模块加载时先用默认路径初始化;set_vault_root() 可在 CLI 启动时覆盖
-VAULT_ROOT: Path = _resolve_vault_root()
+VAULT_ROOT: Path = Path(os.environ.get("SE_VAULT") or _derive_default_vault_root()).resolve()
 ROLE_GENE_DIR: Path = VAULT_ROOT / "00-系统" / "角色基因" / "se"
 SKILL_DIR: Path = VAULT_ROOT / "20-知识" / "角色技能" / "se"
 RETROSPECTIVE_DIR: Path = VAULT_ROOT / "00-系统" / "复盘记录"
@@ -75,10 +76,13 @@ def set_vault_root(explicit: str | None = None) -> Path:
     return v
 
 # skillMind 路径
-SKILLMIND_ROOT = Path(os.environ.get("SKILLMIND_REPO", r"E:\workstation\ai\skillMind"))
+_sm_spec = find_spec("skillmind")
+SKILLMIND_ROOT = Path(os.environ["SKILLMIND_REPO"]).expanduser().resolve() if os.environ.get("SKILLMIND_REPO") else (
+    Path(_sm_spec.origin).resolve().parent.parent if _sm_spec and _sm_spec.origin else None
+)
 
 # 状态目录(本 skill 内部)
-STATE_DIR = SKILL_ROOT / "_state"
+STATE_DIR = Path(os.environ.get("SE_STATE_DIR") or SKILL_ROOT / "_state").resolve()
 LEDGER_FILE = STATE_DIR / "injection_ledger.jsonl"
 AUDIT_DIR = STATE_DIR / "audit"
 APPROVED_FILE = AUDIT_DIR / "approved.jsonl"
@@ -86,9 +90,7 @@ REVIEW_FILE = AUDIT_DIR / "manual-review.jsonl"
 REJECT_FILE = AUDIT_DIR / "rejects.jsonl"
 UNKNOWN_FILE = STATE_DIR / "unknown-queue.md"
 
-# 创建状态目录
-for d in (STATE_DIR, AUDIT_DIR, RETROSPECTIVE_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+# Runtime functions create required directories; importing must not write a vault.
 
 # ---------------------------------------------------------------------------
 # 角色映射(模板推导,支持任意角色 + 多 domain)
@@ -192,19 +194,41 @@ class AuditResult:
     source_hash: str
     draft_path: str
     role: str
-    coverage: float = 0.0              # 0-100,直接读 skillMind.coverage_weighted
+    coverage: float | None = None      # Display only; None means unmeasured.
     hallucination_rate: float = 0.0     # 0-1,len(hallucinations) / len(items)
-    needs_human_review: bool = False    # 直接读 skillMind.needs_human_review
+    needs_human_review: bool = True
     missing: list[dict] = field(default_factory=list)   # [{section, statement, reason}]
-    verdict: str = "unknown"            # PASS / FAIL(直接读 skillMind.verdict)
+    verdict: str = "UNKNOWN"
     notes: list[str] = field(default_factory=list)
+    coverage_status: str = "UNKNOWN"
+    support_status: str = "UNKNOWN"
+    synthesis_status: str = "UNKNOWN"
+    source_inventory_status: str = "UNKNOWN"
+    schema_version: str = ""
+    audit_prompt_version: str = ""
+    draft_paths: list[str] = field(default_factory=list)
+    draft_sha256: dict[str, str] = field(default_factory=dict)
+    artifact_paths: list[str] = field(default_factory=list)
+    artifact_sha256: dict[str, str] = field(default_factory=dict)
+    audit_details: dict = field(default_factory=dict)
+
+    @property
+    def is_approved(self) -> bool:
+        if self.verdict != "PASS" or self.needs_human_review is not False:
+            return False
+        if self.schema_version == "semantic_distillation_v1":
+            return all(getattr(self, name) == "PASS" for name in (
+                "coverage_status", "support_status", "synthesis_status", "source_inventory_status"
+            ))
+        return not self.schema_version
 
     def to_dict(self) -> dict:
         return self.__dict__.copy()
 
 
-# audit 入库阈值:单一来源在 skillmind.auditor.PASS_COVERAGE_THRESHOLD。
-# 需要时 `import skillmind.auditor as a; a.PASS_COVERAGE_THRESHOLD`,本层不再维护本地副本。
+def format_coverage(value: float | None) -> str:
+    """An unmeasured audit must not be displayed as numeric zero."""
+    return "未测" if value is None else f"{value:.1f}%"
 
 
 
@@ -218,6 +242,7 @@ class RoutedSkill:
     new_path: Path  # 绝对路径
     target_subdir: Path
     domain: str = "se"
+    audit: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -327,16 +352,8 @@ def detect_role_from_text(text: str) -> str | None:
 
 
 def ensure_skillmind_venv() -> None:
-    """检查当前 Python 是否在 skillMind .venv 下,否则给出明确指引。"""
-    exe = sys.executable
-    expected = SKILLMIND_ROOT / ".venv"
-    if not str(exe).startswith(str(expected)):
-        print(
-            f"[WARN] 当前 Python 不在 skillMind .venv 下: {exe}\n"
-            f"      期望: {expected / 'Scripts' / 'python.exe' if os.name == 'nt' else 'bin/python'}\n"
-            f"      请先激活 venv: {expected / 'Scripts' / 'activate.bat' if os.name == 'nt' else expected / 'bin' / 'activate'}"
-        )
-        # 不 abort — 让用户看到警告,自行决定
+    """Use the current interpreter; installed packages need no guessed venv path."""
+    import_skillmind()
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +363,7 @@ def ensure_skillmind_venv() -> None:
 def import_skillmind():
     """动态 import skillMind,确保 sys.path 含 skillmind 包所在目录。"""
     pkg_root = SKILLMIND_ROOT
-    if str(pkg_root) not in sys.path:
+    if pkg_root is not None and str(pkg_root) not in sys.path:
         sys.path.insert(0, str(pkg_root))
     try:
         from skillmind import collector, extractor, config  # noqa: F401

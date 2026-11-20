@@ -19,12 +19,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPT_DIR.parent
 
 # 与 _common.SKILLMIND_ROOT 同来源(不 import _common,自己算)
-SKILLMIND_ROOT = Path(os.environ.get("SKILLMIND_REPO") or r"E:\workstation\ai\skillMind")
+SKILLMIND_ROOT = Path(os.environ["SKILLMIND_REPO"]).expanduser().resolve() if os.environ.get("SKILLMIND_REPO") else None
 
 
-def _check_vault() -> tuple[str, str]:
+def _check_vault(explicit: str | None = None) -> tuple[str, str]:
     """返回 (status, msg)。status ∈ ok | fail。"""
-    sev = os.environ.get("SE_VAULT")
+    sev = explicit or os.environ.get("SE_VAULT")
     if sev:
         v = Path(sev)
         if not v.exists():
@@ -44,21 +44,28 @@ def _check_vault() -> tuple[str, str]:
 
 def _check_skillmind() -> tuple[str, str]:
     """返回 (status, msg)。"""
-    if str(SKILLMIND_ROOT) not in sys.path:
+    if SKILLMIND_ROOT is not None and str(SKILLMIND_ROOT) not in sys.path:
         sys.path.insert(0, str(SKILLMIND_ROOT))
     try:
-        import skillmind  # noqa: F401
-        return ("ok", f"skillmind 可 import(从 {SKILLMIND_ROOT})")
-    except ImportError as e:
+        from skillmind import distillation, renderer
+        from skillmind.semantic_auditor import SemanticAuditReport
+        required = {"coverage_status", "support_status", "synthesis_status", "source_inventory_status"}
+        if (distillation.SCHEMA_VERSION != "semantic_distillation_v1"
+                or not required.issubset(SemanticAuditReport.__dataclass_fields__)
+                or not callable(renderer.load_artifact_evidence)
+                or not callable(distillation.renderable_sections)):
+            raise ValueError("需要 SkillMind v2.5 semantic_distillation_v1 与四维审计契约")
+        return ("ok", "当前 Python 支持 SkillMind v2.5 semantic_distillation_v1 与证据审计")
+    except (ImportError, AttributeError, ValueError) as e:
         return ("fail",
-                f"skillmind 无法 import({e})\n"
-                f"      → pip install skillmind,或 export SKILLMIND_REPO=<本地 skillMind 仓库>")
+                f"SkillMind 语义契约不可用({e})\n"
+                f"      → 当前 Python 需安装支持 semantic_distillation_v1 的 v2.5；或设置 SKILLMIND_REPO")
 
 
-def check() -> None:
+def check(vault: str | None = None) -> None:
     """前置检查。任一 fail 则打印清单 + sys.exit(1)。"""
     print("preflight: 前置检查 vault + skillmind ...")
-    items = [("vault", _check_vault()), ("skillmind", _check_skillmind())]
+    items = [("vault", _check_vault(vault)), ("skillmind", _check_skillmind())]
     has_fail = False
     for name, (status, msg) in items:
         mark = "✓" if status == "ok" else "✗"
@@ -72,4 +79,7 @@ def check() -> None:
 
 
 if __name__ == "__main__":
-    check()
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--vault")
+    check(parser.parse_args().vault)

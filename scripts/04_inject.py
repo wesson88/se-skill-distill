@@ -1,41 +1,33 @@
 """
-阶段 5: Inject — 写 vault skill 文件 + 改角色基因 frontmatter
+阶段 5: Inject — 写入由目录和 trigger 动态召回的 vault skill
 
-关键能力:
-- 原子写 vault skill 文件
-- 改 frontmatter: skill_refs / rule_refs 追加(用 ruamel.yaml 保注释)
-- 原角色基因 .bak 备份
-- ledger 记录每次操作,partial 失败时由 05_rollback 还原
+审核绑定草稿、暂存正文及证据后，仅写入最终 Markdown/证据对。角色基因不参与登记。
+ledger 保存独立操作 ID、写后哈希和原始字节；部分失败恢复原状。
 """
 from __future__ import annotations
 
 import json
 import re
-import shutil
 import sys
 import time
+from uuid import uuid4
 from datetime import date
 from pathlib import Path
-from typing import Any
 
 import _common
+from semantic_publication import (
+    SEMANTIC_SCHEMA, assert_owned_pair, canonical_json, complete_snapshots,
+    evidence_draft, renderer_module, restore_snapshots, sha256_file,
+    snapshot, validate_audit, validate_destinations, validate_semantic, vault_path,
+)
 from _common import (
-    LEDGER_FILE,
     RoutedSkill,
-    STATE_DIR,
     append_ledger,
     atomic_write_text,
-    create_role_gene_template,
-    ensure_role_dirs,
-    role_gene_file,
 )
 
 
 # vault 路径在 set_vault_root() 后会改,这里用函数动态查
-def _role_gene_dir() -> Path:
-    return _common.ROLE_GENE_DIR
-
-
 def _retrospective_dir() -> Path:
     return _common.RETROSPECTIVE_DIR
 
@@ -54,6 +46,9 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
     合并 skillMind 默认 frontmatter(uuid / source_reliability / obsolescence_risk / doc_type)
     与 vault 现有字段(role / skill_id / type / lifecycle)。
     """
+    validate_semantic(draft)
+    if draft.get("schema_version") == SEMANTIC_SCHEMA:
+        return _render_semantic_skill(routed, draft)
     meta = draft.get("meta", {})
     source = draft.get("source", {})
     le = draft.get("learning_enhancement", {})
@@ -67,11 +62,6 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
     }
     role = role_label_map.get(routed.role, routed.role)
     skill_id = f"{routed.prefix}{routed.next_n}"
-    # type: draft.meta.type(可能是 list),取第一个
-    type_field = meta.get("type", [])
-    if isinstance(type_field, list):
-        type_field = type_field[0] if type_field else "concept-explanation"
-
     # 渲染 markdown 正文
     body_lines: list[str] = []
     body_lines.append(f"# {meta.get('name', '未命名')}")
@@ -191,30 +181,21 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
 
     # frontmatter
     # trigger:让 agent-workflow 能按关键词决定是否注入(缺 trigger 会被 fail-closed 跳过)
-    trig_kws: list[str] = []
-    tk = meta.get("trigger_keywords") or []
-    if isinstance(tk, list):
-        trig_kws = [str(x) for x in tk if str(x).strip()]
-    if not trig_kws:
-        tags = le.get("knowledge_tags") or []
-        if isinstance(tags, list):
-            trig_kws = [str(x) for x in tags if str(x).strip()]
-    if role and role not in trig_kws:
-        trig_kws.append(role)  # 角色名也作关键词,便于按角色触发
+    trig_kws = _trigger(draft)["keywords"]
 
     fm_lines: list[str] = ["---"]
     fm_lines.append(f"role: {role}")
     fm_lines.append(f"skill_id: {skill_id}")
-    fm_lines.append(f"type: {type_field}")
+    fm_lines.append("type: skill")
     fm_lines.append(f"lifecycle: NEW")
     fm_lines.append("trigger:")
     fm_lines.append("  always: false")
     fm_lines.append("  keywords:")
-    for kw in trig_kws[:8]:
+    for kw in trig_kws:
         fm_lines.append(f"    - {json.dumps(kw, ensure_ascii=False)}")
     fm_lines.append("  file_patterns: []")
     fm_lines.append(f"uuid: {draft.get('uuid', '')}")
-    fm_lines.append(f"source_url: {source.get('source_url') or source.get('repo_url', '')}")
+    fm_lines.append(f"source_url: {json.dumps(source.get('source_url') or source.get('repo_url', ''), ensure_ascii=False)}")
     fm_lines.append(f"source_hash: {source.get('source_hash', '')}")
     fm_lines.append(f"source_reliability: {draft.get('source_reliability', 'medium')}")
     fm_lines.append(f"obsolescence_risk: {draft.get('obsolescence_risk', 'medium')}")
@@ -227,177 +208,126 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 角色基因 frontmatter 改写
+# 动态 trigger frontmatter 及兼容接口
 # ---------------------------------------------------------------------------
 
-def patch_role_gene(role: str, new_skill_filename: str, dry_run: bool = False, domain: str = "se") -> dict:
-    """
-    改 角色-{role}.md 的 frontmatter:
-    - skill_refs 追加 '20-知识/角色技能/{domain}/{role}/{new_skill_filename}.md'
-    - rule_refs 追加 '[[{new_skill_filename}#3. 核心约束]]'
-    基因文件不存在时自动按模板创建(新角色零配置)。
-    原子写 + .bak 备份 + ledger 记录。
-    返回 {ok, relpath, prev_refs, new_refs, prev_rule_refs, new_rule_refs}
-
-    若 dry_run=True,只返回 diff 不写盘。
-    """
-    gene_file = role_gene_file(role, domain)
-    if not gene_file.exists():
-        if dry_run:
-            return {"ok": False, "error": f"角色基因文件不存在(dry-run 不自动建): {role} → {gene_file}"}
-        create_role_gene_template(role, domain)
-
-    new_skill_ref = f"20-知识/角色技能/{domain}/{role}/{new_skill_filename}.md"
-    new_rule_ref = f"[[{new_skill_filename}#3. 核心约束]]"
-
-    if dry_run:
-        # 只读 frontmatter 报告
-        text = gene_file.read_text(encoding="utf-8")
-        return {
-            "ok": True,
-            "dry_run": True,
-            "relpath": str(gene_file.relative_to(_vault_root())),
-            "would_add_skill_ref": new_skill_ref,
-            "would_add_rule_ref": new_rule_ref,
-            "current_skill_refs": _extract_field(text, "skill_refs"),
-            "current_rule_refs": _extract_field(text, "rule_refs"),
-        }
-
-    # 真实改写:用 ruamel.yaml
-    try:
-        from ruamel.yaml import YAML
-    except ImportError:
-        return {"ok": False, "error": "ruamel.yaml 未安装,跑: pip install ruamel.yaml"}
-
-    yaml = YAML()
-    yaml.preserve_quotes = True
-    yaml.width = 4096
-
-    # 备份
-    backup_path = gene_file.with_suffix(gene_file.suffix + ".bak")
-    shutil.copy2(gene_file, backup_path)
-
-    # 读 + 改
-    text = gene_file.read_text(encoding="utf-8")
-    # 文件结构:`---\nfrontmatter\n---\nmarkdown body\n`,用 split 取 frontmatter 单独解析
-    # 避免 ruamel 把 markdown body 当成第二个 YAML doc 报 multi-doc 错
-    import re as _re
-    parts = _re.split(r'^---\s*$', text, maxsplit=2, flags=_re.MULTILINE)
-    # parts 长度: 3 = ['', frontmatter_yaml, markdown_body]
-    if len(parts) < 3:
-        return {"ok": False, "error": f"{gene_file} 不是标准 frontmatter 文件格式"}
-
-    frontmatter_text = parts[1].strip()
-    body = parts[2]  # 保留原 markdown body
-    try:
-        data = yaml.load(frontmatter_text)
-    except Exception as e:
-        return {"ok": False, "error": f"解析 frontmatter 失败: {e}"}
-
-    if data is None or not isinstance(data, dict):
-        return {"ok": False, "error": f"frontmatter 为空或非 dict: {gene_file}"}
-
-    prev_skill_refs = list(data.get("skill_refs", []) or [])
-    prev_rule_refs = list(data.get("rule_refs", []) or [])
-
-    new_skill_refs = list(prev_skill_refs)
-    if new_skill_ref not in new_skill_refs:
-        new_skill_refs.append(new_skill_ref)
-    new_rule_refs = list(prev_rule_refs)
-    if new_rule_ref not in new_rule_refs:
-        new_rule_refs.append(new_rule_ref)
-
-    data["skill_refs"] = new_skill_refs
-    data["rule_refs"] = new_rule_refs
-
-    # 输出:重新拼装 `--- new_frontmatter ---\n body`
-    from io import StringIO
-    buf = StringIO()
-    yaml.dump(data, buf)
-    new_text = f"---\n{buf.getvalue()}---\n{body}"
-
-    # 原子写
-    atomic_write_text(gene_file, new_text)
-
-    # ledger
-    relpath = str(gene_file.relative_to(_vault_root()))
-    append_ledger({
-        "action": "frontmatter_patched",
-        "relpath": relpath,
-        "added_skill_ref": new_skill_ref,
-        "added_rule_ref": new_rule_ref,
-        "prev_skill_refs_count": len(prev_skill_refs),
-        "new_skill_refs_count": len(new_skill_refs),
-        "status": "ok",
-    })
-
-    return {
-        "ok": True,
-        "relpath": relpath,
-        "prev_skill_refs": prev_skill_refs,
-        "new_skill_refs": new_skill_refs,
-        "prev_rule_refs": prev_rule_refs,
-        "new_rule_refs": new_rule_refs,
-    }
+def _render_semantic_skill(routed: RoutedSkill, draft: dict) -> str:
+    """Keep SkillMind's exact canonical body; only extend its frontmatter."""
+    import yaml
+    trigger = _trigger(draft)
+    renderer = renderer_module()
+    # v2.5 renderer has no content settings; a nonempty cfg avoids loading a
+    # machine's default config just to format an already approved document.
+    rendered = renderer.render_to_markdown(evidence_draft(draft), {"se_publication": True})
+    _, frontmatter, body = rendered.split("---", 2)
+    data = yaml.safe_load(frontmatter)
+    data.update(role=routed.role, skill_id=f"{routed.prefix}{routed.next_n}", lifecycle="NEW",
+                schema_version=SEMANTIC_SCHEMA, type="skill", trigger=trigger)
+    for key in ("source_url", "source_repo", "parent_source"):
+        if key in data:
+            data[key] = renderer._QuotedLink(data[key])
+    encoded = yaml.dump(data, Dumper=renderer._FrontmatterDumper, allow_unicode=True,
+                        default_flow_style=False, sort_keys=False).strip()
+    return f"---\n{encoded}\n---{body}"
 
 
-def _extract_field(text: str, field: str) -> list[str]:
-    """简易 frontmatter 字段提取(用于 dry_run 报告)。"""
-    in_fm = False
-    lines = text.split("\n")
-    out: list[str] = []
-    in_field = False
-    for line in lines:
-        if line.strip() == "---":
-            if in_fm:
-                break
-            in_fm = True
+class TriggerPolicyError(ValueError):
+    """Source metadata needs review before the skill can enter dynamic recall."""
+
+
+def _trigger(draft: dict) -> dict:
+    meta = draft.get("meta") or {}
+    keywords = meta.get("trigger_keywords")
+    if draft.get("schema_version") != SEMANTIC_SCHEMA and keywords in (None, []):
+        keywords = (draft.get("learning_enhancement") or {}).get("knowledge_tags")
+    if (not isinstance(keywords, list) or not keywords
+            or not all(isinstance(value, str) and value.strip() for value in keywords)):
+        raise TriggerPolicyError("trigger_keywords_invalid: audited keywords must be a nonempty string list")
+    # Only audited metadata supplies terms. Never invent role/category fallbacks.
+    cleaned, seen = [], set()
+    for value in keywords:
+        keyword = value.strip()
+        if keyword.casefold() not in seen:
+            seen.add(keyword.casefold())
+            cleaned.append(keyword)
+    return {"always": False, "keywords": cleaned, "file_patterns": []}
+
+
+def _validate_trigger_pool(routed: RoutedSkill, draft: dict) -> None:
+    """Enforce vault role-gene norm section 10.4's directory-unique keyword."""
+    from collections import Counter
+    import yaml
+    keywords = {value.casefold() for value in _trigger(draft)["keywords"]}
+    current = Path(routed.new_path).resolve()
+    previous = {}
+    for path in sorted(Path(routed.target_subdir).glob("*.md")):
+        # Vault norm section 10.2 / engine _skill_files exclude helper notes.
+        if path.name.startswith(("_", ".")):
             continue
-        if not in_fm:
-            continue
-        if line.startswith(f"{field}:"):
-            rest = line[len(field) + 1:].strip()
-            if rest.startswith("[") and rest.endswith("]"):
-                inner = rest[1:-1]
-                out = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
-                in_field = False
-            else:
-                in_field = True
-        elif in_field:
-            stripped = line.strip()
-            if stripped.startswith("-"):
-                out.append(stripped[1:].strip().strip("'\""))
-            elif stripped and not stripped.startswith("-"):
-                in_field = False
-    return out
+        try:
+            text = path.read_text(encoding="utf-8")
+            parts = re.split(r"^---[ \t]*$", text, maxsplit=2, flags=re.MULTILINE)
+            if len(parts) != 3 or parts[0].strip():
+                raise ValueError("missing frontmatter")
+            frontmatter = yaml.safe_load(parts[1])
+            trigger = frontmatter.get("trigger") or {} if isinstance(frontmatter, dict) else None
+            if not isinstance(trigger, dict):
+                raise ValueError("invalid trigger object")
+            existing = trigger.get("keywords") or []
+            if not isinstance(existing, list) or not all(isinstance(value, str) and value.strip() for value in existing):
+                raise ValueError("invalid keyword list")
+            previous[path.resolve()] = {value.strip().casefold() for value in existing}
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            raise TriggerPolicyError(f"trigger_inventory_invalid: review existing role skill {path.name}") from exc
+    others = {path: words for path, words in previous.items() if path != current}
+    occupied = set().union(*others.values())
+    # At least one unique term is mandated by the existing vault norm, not a
+    # newly chosen quality threshold. Comparisons follow case-insensitive recall.
+    if not keywords - occupied:
+        raise TriggerPolicyError("trigger_keywords_not_unique: no audited keyword is unique in this role directory")
+    # Preserve existing keyword cards that were distinguishable before this
+    # operation. Old self participates in the before-pool when updating a card;
+    # always/file-pattern-only entries and preexisting collisions need no repair.
+    before_counts = Counter(word for words in previous.values() for word in words)
+    after_counts = Counter(word for words in others.values() for word in words)
+    after_counts.update(keywords)
+    for path, words in others.items():
+        if any(before_counts[word] == 1 for word in words) and not any(after_counts[word] == 1 for word in words):
+            raise TriggerPolicyError(
+                f"trigger_existing_keyword_uniqueness_lost: publication removes the last unique keyword of {path.name}"
+            )
 
 
-# ---------------------------------------------------------------------------
-# 写 vault skill 文件
-# ---------------------------------------------------------------------------
+def patch_role_gene(role: str, new_skill_filename: str, dry_run: bool = False,
+                    domain: str = "se") -> dict:
+    """Compatibility no-op: directory + trigger is the only skill registry."""
+    return {"ok": True, "reason": "dynamic_trigger", "gene_changed": False}
+
 
 def copy_skill_to_vault(routed: RoutedSkill, draft: dict, dry_run: bool = False) -> dict:
-    """
-    渲染并原子写 vault skill 文件。
-    返回 {ok, new_path, ...}
-    """
-    content = render_vault_skill(routed, draft)
-    if dry_run:
-        return {"ok": True, "dry_run": True, "new_path": str(routed.new_path), "preview": content[:500]}
-
+    """Write/verify a generated pair; authorization is enforced by inject_one."""
+    snapshots = []
     try:
-        atomic_write_text(routed.new_path, content)
-    except Exception as e:
-        return {"ok": False, "error": str(e), "new_path": str(routed.new_path)}
-
-    relpath = str(routed.new_path.relative_to(_vault_root()))
-    append_ledger({
-        "action": "skill_file_copied",
-        "relpath": relpath,
-        "role": routed.role,
-        "status": "ok",
-    })
-    return {"ok": True, "new_path": str(routed.new_path)}
+        skill, sidecar = validate_destinations(routed)
+        assert_owned_pair(skill, draft)
+        content = render_vault_skill(routed, draft)
+        if dry_run:
+            return {"ok": True, "dry_run": True, "new_path": str(skill), "preview": content}
+        snapshots = [snapshot(skill), snapshot(sidecar)]
+        atomic_write_text(skill, content)
+        if skill.read_text(encoding="utf-8") != content:
+            raise ValueError("Final Markdown differs from the rendered audited card")
+        envelope = {"artifact_sha256": sha256_file(skill), "draft": evidence_draft(draft)}
+        atomic_write_text(sidecar, json.dumps(envelope, ensure_ascii=False, indent=2) + "\n")
+        checked = renderer_module().load_artifact_evidence(skill)
+        if canonical_json(checked["draft"]) != canonical_json(evidence_draft(draft)):
+            raise ValueError("Final evidence differs from canonical audited card")
+        return {"ok": True, "new_path": str(skill), "artifact_sha256": checked["artifact_sha256"],
+                "evidence_sha256": sha256_file(sidecar)}
+    except Exception as exc:
+        if snapshots:
+            restore_snapshots(snapshots)
+        return {"ok": False, "error": str(exc), "new_path": str(routed.new_path)}
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +339,9 @@ def write_retrospective_log(
     gene_patches: list[dict],
 ) -> None:
     """追加复盘记录:每次注入写一条。"""
+    gene_patches = [patch for patch in gene_patches if patch.get("gene_changed")]
     today = date.today().isoformat()
+    _retrospective_dir().mkdir(parents=True, exist_ok=True)
     log_file = _retrospective_dir() / f"{today}-角色注入.md"
     with log_file.open("a", encoding="utf-8") as f:
         f.write(f"\n## skill-mind-distill run @ {time.strftime('%H:%M:%S')}\n\n")
@@ -429,16 +361,49 @@ def write_retrospective_log(
 # ---------------------------------------------------------------------------
 
 def inject_one(routed: RoutedSkill, draft: dict, dry_run: bool = False) -> dict:
-    """对单条 routed 走 copy_skill_to_vault + patch_role_gene。"""
-    copy_result = copy_skill_to_vault(routed, draft, dry_run=dry_run)
-    if not copy_result["ok"]:
-        return {"ok": False, "stage": "copy", "error": copy_result.get("error")}
-
-    patch_result = patch_role_gene(routed.role, routed.new_filename, dry_run=dry_run, domain=routed.domain)
-    if not patch_result["ok"]:
-        return {"ok": False, "stage": "patch", "error": patch_result.get("error"), "copy_result": copy_result}
-
-    return {"ok": True, "copy": copy_result, "patch": patch_result}
+    """Authorize dynamic recall before committing the Markdown/evidence pair."""
+    snapshots = []
+    stage = "guard"
+    try:
+        skill, sidecar = validate_destinations(routed)
+        validate_audit(routed, draft)
+        assert_owned_pair(skill, draft)
+        stage = "trigger"
+        _validate_trigger_pool(routed, draft)
+        patch = patch_role_gene(routed.role, routed.new_filename, dry_run=True, domain=routed.domain)
+        if dry_run:
+            copied = copy_skill_to_vault(routed, draft, dry_run=True)
+            return {"ok": copied["ok"], "stage": "copy", "copy": copied, "patch": patch}
+        snapshots = [snapshot(path) for path in (skill, sidecar)]
+        operation_id = uuid4().hex
+        stage = "copy"
+        copied = copy_skill_to_vault(routed, draft)
+        if not copied["ok"]:
+            raise ValueError(copied.get("error", "Publication pair write failed"))
+        # Verify the actual final pair before committing its recoverable state.
+        renderer_module().load_artifact_evidence(skill)
+        if sha256_file(skill) != copied["artifact_sha256"] or sha256_file(sidecar) != copied["evidence_sha256"]:
+            raise ValueError("Publication pair changed during transaction")
+        stage = "ledger"
+        append_ledger({"action": "publication_committed", "status": "ok", "run_id": operation_id,
+                       "operation_id": operation_id, "relpath": skill.relative_to(_vault_root()).as_posix(),
+                       "role": routed.role, "uuid": draft.get("uuid", ""),
+                       "artifact_sha256": copied["artifact_sha256"], "evidence_sha256": copied["evidence_sha256"],
+                       "files": complete_snapshots(snapshots)})
+        return {"ok": True, "copy": copied, "patch": patch, "run_id": operation_id}
+    except Exception as exc:
+        rollback_error = None
+        if snapshots:
+            try:
+                restore_snapshots(snapshots)
+            except Exception as rollback_exc:
+                rollback_error = str(rollback_exc)
+        result = {"ok": False, "stage": stage, "error": str(exc)}
+        if isinstance(exc, TriggerPolicyError):
+            result["needs_human_review"] = True
+        if rollback_error:
+            result["rollback_error"] = rollback_error
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -449,12 +414,12 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     from rich.console import Console
 
-    parser = argparse.ArgumentParser(description="阶段 5: 写 vault + 改 frontmatter")
+    parser = argparse.ArgumentParser(description="阶段 5: 写入动态 trigger 技能及证据")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
     console = Console()
-    routed_path = Path("_state/routed.jsonl")
+    routed_path = _common.STATE_DIR / "routed.jsonl"
     if not routed_path.exists():
         console.print(f"[red]找不到 {routed_path},先跑阶段 4[/red]")
         return 1
@@ -468,18 +433,24 @@ def main(argv: list[str] | None = None) -> int:
             line = line.strip()
             if not line:
                 continue
-            rd = json.loads(line)
-            routed = RoutedSkill(
-                draft_path=rd["draft_path"],
-                role=rd["role"],
-                prefix=rd["prefix"],
-                next_n=rd["next_n"],
-                new_filename=rd["new_filename"],
-                new_path=Path(rd["new_path"]),
-                target_subdir=Path(rd["target_subdir"]),
-                domain=rd.get("domain", "se"),
-            )
-            draft = _load_draft(routed.draft_path)
+            try:
+                rd = json.loads(line)
+                routed = RoutedSkill(
+                    draft_path=rd["draft_path"],
+                    role=rd["role"],
+                    prefix=rd["prefix"],
+                    next_n=rd["next_n"],
+                    new_filename=rd["new_filename"],
+                    new_path=Path(rd["new_path"]),
+                    target_subdir=Path(rd["target_subdir"]),
+                    domain=rd.get("domain", "se"),
+                    audit=rd.get("audit", {}),
+                )
+                draft = _load_draft(routed.draft_path)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                console.print(f"[red]路由记录或草稿无效: {type(exc).__name__}[/red]")
+                failed.append({"error": "invalid routed record or draft"})
+                continue
             if not draft:
                 console.print(f"[red]草稿丢失: {routed.draft_path}[/red]")
                 failed.append({"routed": rd, "error": "draft missing"})

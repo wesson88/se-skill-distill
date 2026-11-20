@@ -1,289 +1,189 @@
-"""
-Pipeline 编排器: 串联 6 阶段(ingest → extract → publish → audit → route → inject)
-
-v2: 阶段 3 audit 改用 skillMind LLM audit_source,本层按 kind 加权算 score。
-
-用法:
-    python pipeline.py --config sources.yaml [--dry-run] [--skip-extract] [--skip-publish] [--status]
-    python pipeline.py --status
-"""
+"""Scoped SkillMind v2.5 extraction, audit, routing and evidence-aware injection."""
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, replace
+import hashlib
+from importlib.util import module_from_spec, spec_from_file_location
 import json
-import sys
 from pathlib import Path
-from typing import Any
-
+import sys
+import uuid
 from rich.console import Console
 
-# 前置检查(在 import _common 前,避开其模块加载时的 vault 硬解析)
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
-import preflight as _preflight
-_preflight.check()
-
-from _common import (
-    LEDGER_FILE,
-    STATE_DIR,
-    ensure_skillmind_venv,
-    import_skillmind,
-)
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import preflight
+import _common
+from _common import AuditResult, atomic_write_text, ensure_skillmind_venv, format_coverage
 
 
 def load_sources(config_path: Path) -> list[dict]:
-    """加载 sources.yaml。"""
     import yaml
-    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    sources = cfg.get("sources", [])
-    if not sources:
-        raise ValueError(f"sources.yaml 中无 sources 列表: {config_path}")
-    # 校验每条
-    for i, s in enumerate(sources):
-        if "kind" not in s:
-            raise ValueError(f"第 {i+1} 条缺 kind: {s}")
-        if s["kind"] in ("github_repo", "github_raw", "rss", "single_url") and not s.get("url"):
-            raise ValueError(f"第 {i+1} 条 kind={s['kind']} 缺 url")
-        if s["kind"] == "local_dir" and not s.get("path"):
-            raise ValueError(f"第 {i+1} 条 kind=local_dir 缺 path")
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    sources = config.get("sources", []) if isinstance(config, dict) else []
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("sources.yaml 需要非空 sources 列表")
+    kinds = {"github_repo", "github_raw", "rss", "single_url", "local_dir"}
+    for source in sources:
+        if not isinstance(source, dict) or source.get("kind") not in kinds:
+            raise ValueError("来源 kind 无效")
+        field = "path" if source["kind"] == "local_dir" else "url"
+        if not source.get(field):
+            raise ValueError(f"来源缺少 {field}")
     return sources
 
 
-def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = False, domain: str = "se") -> int:
-    """跑完整 5 阶段流水线。"""
-    from rich.console import Console
-    console = Console()
+def _load_stage(filename: str):
+    name = "_se_" + Path(filename).stem
+    spec = spec_from_file_location(name, SCRIPT_DIR / filename)
+    module = module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
+
+def _load_draft(path: str) -> dict | None:
+    if not path:
+        return None
+    try:
+        draft = json.loads(Path(path).read_text(encoding="utf-8"))
+        return draft if isinstance(draft, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = False, domain: str = "se") -> int:
+    """Dry-run may call models and write staging, but never writes final vault files."""
+    console = Console()
     ensure_skillmind_venv()
     sources = load_sources(config_path)
-    console.print(f"[bold]=== skillmind-to-vault 蒸馏流水线 ===[/bold]")
-    console.print(f"config: {config_path}")
-    console.print(f"dry_run: {dry_run}  skip_extract: {skip_extract}")
-    console.print(f"源数: {len(sources)}")
-    console.print()
-
-    # 阶段 1: ingest
-    console.print("[bold]━━━ 阶段 1: ingest ━━━[/bold]")
-    from importlib.machinery import SourceFileLoader
-    ingest_mod = SourceFileLoader("ingest", str(Path(__file__).parent / "01_ingest.py")).load_module()
-    batch_results = ingest_mod.ingest_batch(sources, console=console)
-
-    # 收集 source_infos(包括 skipped 的 — 已缓存但内容可继续 extract)
-    source_infos: list[dict] = []
-    for _, docs in batch_results:
-        for d in docs:
-            source_infos.append(d)
-
-    n_skipped = sum(1 for d in source_infos if d.get("skipped"))
-    n_new = len(source_infos) - n_skipped
-    console.print(f"\n  实际可处理: {len(source_infos)} (新增 {n_new} / 已缓存 {n_skipped})")
-    if not source_infos:
-        console.print("[yellow]无新增源,流水线结束[/yellow]")
-        return 0
-
-    # 阶段 2: extract
-    if not skip_extract:
-        console.print("\n[bold]━━━ 阶段 2: extract (LLM) ━━━[/bold]")
-        audit_mod = SourceFileLoader("audit", str(Path(__file__).parent / "02_audit.py")).load_module()
-        extract_results = audit_mod.extract_batch(source_infos, console=console)
-    else:
-        console.print("\n[bold yellow]━━━ 阶段 2: extract 跳过 ━━━[/bold yellow]")
-        # skip-extract 时:用阶段 1 收集的 source_infos(含已缓存源)供 audit 循环用
-        extract_results = [{"source": d, "drafts": []} for d in source_infos]
-
-    # 阶段 2.5: publish_to_vault(必须先于 audit)
-    console.print("\n[bold]━━━ 阶段 2.5: publish_to_vault ━━━[/bold]")
-    audit_mod = SourceFileLoader("audit", str(Path(__file__).parent / "02_audit.py")).load_module()
-    if not dry_run:
-        n_published = audit_mod.publish_all_drafts(console=console)
-        if n_published == 0 and not skip_extract:
-            console.print("[yellow]警告: 无草稿 publish(可能 drafts/ 为空)[/yellow]")
-    else:
-        console.print("  [yellow]dry_run: 跳过 publish[/yellow]")
-
-    # 阶段 3: audit(直接读 skillMind 精简 AuditReport,coverage ≥ 90% → PASS)
-    console.print("\n[bold]━━━ 阶段 3: audit (skillMind LLM, 90% 阈值) ━━━[/bold]")
-
-    audit_results: list = []
-    seen_hashes: set[str] = set()
-    for er in extract_results:
-        src = er["source"]
-        sh = src.get("source_hash", "")
-        if not sh or sh in seen_hashes:
-            continue
-        seen_hashes.add(sh)
-        # 角色推断:target_role 优先,否则用关键词
-        target_role = src.get("target_role", "auto")
-        if target_role and target_role != "auto":
-            role = target_role
-        else:
-            role = _resolve_role_for_audit(target_role, er.get("drafts", [{}])[0] if er.get("drafts") else {}, src)
+    console.print(f"[bold]SE 蒸馏[/bold] sources={len(sources)} dry_run={dry_run}")
+    ingest = _load_stage("01_ingest.py")
+    audit = _load_stage("02_audit.py")
+    route = _load_stage("03_route.py")
+    inject = _load_stage("04_inject.py")
+    stage_root = _common.STATE_DIR / "runs" / uuid.uuid4().hex / "published"
+    results: list[AuditResult] = []
+    source_by_hash: dict[str, dict] = {}
+    for requested, documents in ingest.ingest_batch(sources, console=console):
+        if not documents:
+            results.append(AuditResult("", "", requested.get("target_role", "auto"),
+                                       notes=["采集失败或没有可处理来源"], audit_details={"request": requested}))
+        for document in documents:
+            source = dict(document)
+            source["target_role"] = requested.get("target_role", "auto")
+            source["notes"] = requested.get("notes", "")
+            sh = source.get("source_hash")
+            if not sh:
+                results.append(AuditResult("", "", source["target_role"], notes=["采集结果缺少 source_hash"]))
+            elif sh not in source_by_hash:
+                source_by_hash[sh] = source
+    for sh, source in source_by_hash.items():
+        role = source["target_role"]
         try:
-            ar = audit_mod.audit_one(src, role)
-            audit_results.append(ar)
-            console.print(
-                f"  coverage={ar.coverage:.1f}%  verdict={ar.verdict}  "
-                f"needs_review={ar.needs_human_review}  halluc={ar.hallucination_rate:.2f}  "
-                f"missing={len(ar.missing)}  role={ar.role}"
-            )
-            for note in ar.notes:
-                console.print(f"    [yellow]note:[/yellow] {note}")
-        except Exception as e:
-            console.print(f"  [bold red]FAIL[/bold red] audit ({sh[:12]}): {e}")
-
-    audit_mod.write_audit_results(audit_results)
-
-    n_pass = sum(1 for r in audit_results if r.verdict == "PASS")
-    n_fail = sum(1 for r in audit_results if r.verdict == "FAIL")
-    console.print(f"\n  PASS={n_pass}  FAIL={n_fail}  / 总源 {len(audit_results)}")
-
-    if n_pass == 0:
-        console.print("[yellow]无 PASS(coverage 都 < 90%),后续阶段跳过[/yellow]")
-        return 0
-
-    # 阶段 4: route
-    console.print("\n[bold]━━━ 阶段 4: route ━━━[/bold]")
-    route_mod = SourceFileLoader("route", str(Path(__file__).parent / "03_route.py")).load_module()
-
-    routed: list = []
-    unknowns = 0
-    for ar in audit_results:
-        if ar.verdict != "PASS":
+            if not skip_extract:
+                extracted = audit.extract_batch([source], console=console)
+                if (len(extracted) != 1 or extracted[0].get("error")
+                        or not extracted[0].get("drafts")
+                        or any(d.get("extract_complete", True) is not True for d in extracted[0]["drafts"])):
+                    results.append(AuditResult(sh, "", role, notes=["提取失败或不完整，未发布/审计旧草稿"]))
+                    continue
+            stage = stage_root / hashlib.sha256(sh.encode("utf-8")).hexdigest()
+            count = audit.publish_all_drafts([source], console=console, output_dir=stage)
+            if not count:
+                results.append(AuditResult(sh, "", role, notes=["没有完整草稿可供审计"]))
+                continue
+            report = audit.audit_one(source, role, vault_skills=stage)
+            results.append(report)
+            console.print(f"  coverage={format_coverage(report.coverage)} verdict={report.verdict} review={report.needs_human_review}")
+        except Exception as error:
+            results.append(AuditResult(sh, "", role, notes=[f"发布/审计失败：{type(error).__name__}"],
+                                       audit_details={"error_type": type(error).__name__}))
+    injected, patches, routed = [], [], []
+    reserved: set[tuple[str, str, int]] = set()
+    for report in results:
+        if not report.is_approved:
             continue
-        draft = _load_draft(ar.draft_path)
-        if not draft:
-            console.print(f"  [red]草稿丢失: {ar.draft_path}[/red]")
-            continue
-        src = {"url": "", "notes": ""}  # source_info 不全,简化
-        rs = route_mod.route_one(ar, draft, src, target_role_override=ar.role, domain=domain)
-        if rs is None:
-            route_mod.append_unknown_queue(ar, src, "role resolve failed")
-            unknowns += 1
-            continue
-        routed.append(rs)
-        console.print(f"  {ar.coverage:.1f}%  {rs.role}  {rs.new_filename}")
-
-    console.print(f"\n  routed={len(routed)} unknown={unknowns}")
-    if not routed:
-        console.print("[yellow]无路由成功,跳过 inject[/yellow]")
-        return 0
-
-    # 写 routed.jsonl 给阶段 5
-    routed_path = STATE_DIR / "routed.jsonl"
-    with routed_path.open("w", encoding="utf-8") as f:
-        for rs in routed:
-            f.write(json.dumps({
-                "draft_path": rs.draft_path,
-                "role": rs.role,
-                "prefix": rs.prefix,
-                "next_n": rs.next_n,
-                "new_filename": rs.new_filename,
-                "new_path": str(rs.new_path),
-                "target_subdir": str(rs.target_subdir),
-                "domain": rs.domain,
-            }, ensure_ascii=False) + "\n")
-
-    # 阶段 5: inject
-    console.print("\n[bold]━━━ 阶段 5: inject ━━━[/bold]")
-    inject_mod = SourceFileLoader("inject", str(Path(__file__).parent / "04_inject.py")).load_module()
-
-    injected: list = []
-    failed: list = []
+        paths = report.draft_paths or ([report.draft_path] if report.draft_path else [])
+        if not paths:
+            report.verdict, report.needs_human_review = "UNKNOWN", True
+            report.notes.append("审计未绑定草稿")
+        for path in paths:
+            try:
+                draft = _load_draft(path)
+                if not draft:
+                    raise ValueError("missing draft")
+                card_report = replace(report, draft_path=path)
+                rs = route.route_one(card_report, draft, source_by_hash.get(report.source_hash, {}),
+                                     target_role_override=report.role, domain=domain)
+                if rs is None:
+                    raise ValueError("unresolved role or unapproved audit")
+                while (str(rs.target_subdir), rs.prefix, rs.next_n) in reserved:
+                    rs.next_n += 1
+                    rs.new_filename = f"{rs.prefix}{rs.next_n}-" + rs.new_filename.split("-", 1)[1]
+                    rs.new_path = rs.target_subdir / rs.new_filename
+                reserved.add((str(rs.target_subdir), rs.prefix, rs.next_n))
+                routed.append(rs)
+                outcome = inject.inject_one(rs, draft, dry_run=dry_run)
+                if not outcome.get("ok"):
+                    failure = {key: outcome[key] for key in ("stage", "error", "rollback_error") if key in outcome}
+                    report.audit_details.setdefault("injection_errors", []).append(failure)
+                    if isinstance(outcome.get("error"), str):
+                        report.notes.append(outcome["error"])
+                    raise ValueError(outcome.get("stage", "inject"))
+                injected.append((rs, draft))
+                patches.append(outcome["patch"])
+                console.print(f"  {'预览' if dry_run else '已入库'} {rs.new_filename} → {rs.role}")
+            except Exception as error:
+                report.verdict, report.needs_human_review = "UNKNOWN", True
+                report.notes.append(f"路由/注入失败：{type(error).__name__}")
+                break
+    audit.write_audit_results(results)
+    rows = []
     for rs in routed:
-        draft = _load_draft(rs.draft_path)
-        if not draft:
-            continue
-        result = inject_mod.inject_one(rs, draft, dry_run=dry_run)
-        if result["ok"]:
-            injected.append((rs, draft))
-            console.print(f"  [green]✓[/green] {rs.new_filename} → {rs.role}")
-        else:
-            console.print(f"  [red]✗ {rs.new_filename} 失败 @ {result['stage']}: {result.get('error')}[/red]")
-            failed.append({"routed": rs, "error": result.get("error"), "stage": result.get("stage")})
-
-    # 写复盘日志(非 dry_run)
-    if not dry_run and injected:
-        patches = [r["patch"] for _, r in [(None, i) for i in injected]] if False else []
-        # 实际 patches 需重 inject 拿
-        patches = []
-        for rs, _ in injected:
-            p = inject_mod.patch_role_gene(rs.role, rs.new_filename, dry_run=True)
-            if p["ok"]:
-                patches.append(p)
-        inject_mod.write_retrospective_log(injected, patches)
-
-    console.print(
-        f"\n[bold]=== 完成 ===[/bold]  injected={len(injected)}  failed={len(failed)}"
-    )
-    if failed:
-        console.print("[yellow]部分失败,自动回滚已执行(见 ledger)[/yellow]")
-        return 1
-    return 0
+        row = asdict(rs)
+        row["new_path"], row["target_subdir"] = str(rs.new_path), str(rs.target_subdir)
+        rows.append(json.dumps(row, ensure_ascii=False))
+    atomic_write_text(_common.STATE_DIR / "routed.jsonl", "\n".join(rows) + ("\n" if rows else ""))
+    if injected and not dry_run:
+        inject.write_retrospective_log(injected, patches)
+    n_pass = sum(report.is_approved for report in results)
+    console.print(f"PASS={n_pass} review={len(results)-n_pass} injected={len(injected)}")
+    return 0 if results and all(report.is_approved for report in results) else 1
 
 
 def show_status() -> int:
-    """显示最近运行状态 + ledger 概览。"""
-    from rich.console import Console
     console = Console()
-    console.print("[bold]=== 运行状态 ===[/bold]")
-    console.print(f"ledger: {LEDGER_FILE}")
-    if not LEDGER_FILE.exists():
-        console.print("  [dim]ledger 不存在,无运行记录[/dim]")
-        return 0
-    records = [json.loads(line) for line in LEDGER_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
-    n_skill = sum(1 for r in records if r.get("action") == "skill_file_copied")
-    n_patch = sum(1 for r in records if r.get("action") == "frontmatter_patched")
-    n_restore = sum(1 for r in records if r.get("action") == "frontmatter_restored")
-    console.print(f"  写入 vault skill: {n_skill}")
-    console.print(f"  改 frontmatter:   {n_patch}")
-    console.print(f"  回滚:             {n_restore}")
+    records = _common.read_ledger()
+    console.print(f"ledger: {_common.LEDGER_FILE}")
+    for action in ("skill_file_copied", "frontmatter_patched", "frontmatter_restored", "skill_file_removed"):
+        console.print(f"{action}: {sum(row.get('action')==action for row in records)}")
     return 0
 
 
-def _resolve_role_for_audit(target_role, draft, source) -> str:
-    """resolve role for audit(简化:用 target_role 或 关键词)."""
-    from _common import detect_role_from_text
-    if target_role and target_role != "auto":
-        return target_role
-    text = (source.get("url") or "") + " " + (source.get("notes") or "")
-    return detect_role_from_text(text) or "后端工程师"
-
-
-def _load_draft(draft_path: str) -> dict | None:
-    if not draft_path or not Path(draft_path).exists():
-        return None
-    return json.loads(Path(draft_path).read_text(encoding="utf-8"))
-
-
 def main(argv: list[str] | None = None) -> int:
-    import _common
-    parser = argparse.ArgumentParser(description="skillmind-to-vault 蒸馏流水线")
-    parser.add_argument("--config", help="sources.yaml 路径")
-    parser.add_argument("--vault", help="vault 根路径(默认从脚本位置推导;也可设 SE_VAULT 环境变量)")
-    parser.add_argument("--dry-run", action="store_true", help="不写盘,只输出 diff")
-    parser.add_argument("--skip-extract", action="store_true", help="跳过 extract(已存在 drafts/)")
-    parser.add_argument("--status", action="store_true", help="显示运行状态")
-    parser.add_argument("--domain", default="se", help="角色域(默认 se;agent-workflow 当前只扫 se)")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config")
+    parser.add_argument("--vault")
+    parser.add_argument("--dry-run", action="store_true", help="可调用模型并写暂存，不写最终技能或角色基因")
+    parser.add_argument("--skip-extract", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--domain", default="se")
     args = parser.parse_args(argv)
-
+    preflight.check(args.vault)
+    _common.set_vault_root(args.vault)
     if args.status:
         return show_status()
-
     if not args.config:
         parser.error("需要 --config 或 --status")
-
-    # 必须在所有 vault 派生路径使用前设
-    _common.set_vault_root(args.vault)
-    console = Console()
-    console.print(f"  [dim]vault 根:{_common.VAULT_ROOT}[/dim]")
-
-    config_path = Path(args.config).resolve()
-    if not config_path.exists():
-        print(f"[ERROR] 找不到 config: {config_path}")
+    try:
+        return run_pipeline(Path(args.config).resolve(), dry_run=args.dry_run,
+                            skip_extract=args.skip_extract, domain=args.domain)
+    except (OSError, ValueError) as error:
+        Console().print(f"[red]配置/运行失败：{type(error).__name__}[/red]")
         return 1
-
-    return run_pipeline(config_path, dry_run=args.dry_run, skip_extract=args.skip_extract, domain=args.domain)
 
 
 if __name__ == "__main__":
