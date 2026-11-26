@@ -16,7 +16,7 @@ from pathlib import Path
 
 import _common
 from semantic_publication import (
-    SEMANTIC_SCHEMA, assert_owned_pair, canonical_json, complete_snapshots,
+    SEMANTIC_SCHEMAS, assert_owned_pair, canonical_json, complete_snapshots,
     evidence_draft, renderer_module, restore_snapshots, sha256_file,
     snapshot, validate_audit, validate_destinations, validate_semantic, vault_path,
 )
@@ -47,7 +47,7 @@ def render_vault_skill(routed: RoutedSkill, draft: dict) -> str:
     与 vault 现有字段(role / skill_id / type / lifecycle)。
     """
     validate_semantic(draft)
-    if draft.get("schema_version") == SEMANTIC_SCHEMA:
+    if draft.get("schema_version") in SEMANTIC_SCHEMAS:
         return _render_semantic_skill(routed, draft)
     meta = draft.get("meta", {})
     source = draft.get("source", {})
@@ -222,7 +222,7 @@ def _render_semantic_skill(routed: RoutedSkill, draft: dict) -> str:
     _, frontmatter, body = rendered.split("---", 2)
     data = yaml.safe_load(frontmatter)
     data.update(role=routed.role, skill_id=f"{routed.prefix}{routed.next_n}", lifecycle="NEW",
-                schema_version=SEMANTIC_SCHEMA, type="skill", trigger=trigger)
+                schema_version=draft["schema_version"], type="skill", trigger=trigger)
     for key in ("source_url", "source_repo", "parent_source"):
         if key in data:
             data[key] = renderer._QuotedLink(data[key])
@@ -238,7 +238,7 @@ class TriggerPolicyError(ValueError):
 def _trigger(draft: dict) -> dict:
     meta = draft.get("meta") or {}
     keywords = meta.get("trigger_keywords")
-    if draft.get("schema_version") != SEMANTIC_SCHEMA and keywords in (None, []):
+    if draft.get("schema_version") not in SEMANTIC_SCHEMAS and keywords in (None, []):
         keywords = (draft.get("learning_enhancement") or {}).get("knowledge_tags")
     if (not isinstance(keywords, list) or not keywords
             or not all(isinstance(value, str) and value.strip() for value in keywords)):

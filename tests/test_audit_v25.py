@@ -278,7 +278,8 @@ def test_cli_scopes_cache_and_retains_staging_evidence(env, monkeypatch, tmp_pat
     cached = [env.source, dict(env.source, source_hash="unrelated", source_url="https://example.test/other")]
     monkeypatch.setattr(collector, "list_cached", lambda: cached)
     extracted, audited = [], []
-    monkeypatch.setattr(env.mod, "extract_batch", lambda infos, **kw: extracted.extend(infos) or [])
+    monkeypatch.setattr(env.mod, "extract_batch", lambda infos, **kw: extracted.extend(infos) or [
+        {"source": info, "drafts": [{"extract_complete": True}]} for info in infos])
     def fake_audit(info, role, *, vault_skills):
         audited.append((info, Path(vault_skills)))
         return env.common.AuditResult(info["source_hash"], "", role, verdict="PASS", needs_human_review=False)

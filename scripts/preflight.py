@@ -48,18 +48,23 @@ def _check_skillmind() -> tuple[str, str]:
         sys.path.insert(0, str(SKILLMIND_ROOT))
     try:
         from skillmind import distillation, renderer
-        from skillmind.semantic_auditor import SemanticAuditReport
+        from skillmind.diagnostics import diagnostic_run, TraceRecorder
+        from skillmind.semantic_auditor import SemanticAuditReport, validate_exclusion_approval
         required = {"coverage_status", "support_status", "synthesis_status", "source_inventory_status"}
-        if (distillation.SCHEMA_VERSION != "semantic_distillation_v1"
+        if (distillation.SCHEMA_VERSION != "semantic_distillation_v2"
+                or distillation.LEGACY_SCHEMA_VERSION != "semantic_distillation_v1"
+                or not {"semantic_distillation_v1", "semantic_distillation_v2"}.issubset(distillation.SUPPORTED_SCHEMAS)
                 or not required.issubset(SemanticAuditReport.__dataclass_fields__)
+                or not callable(diagnostic_run) or not callable(TraceRecorder.failure)
+                or not callable(validate_exclusion_approval)
                 or not callable(renderer.load_artifact_evidence)
                 or not callable(distillation.renderable_sections)):
-            raise ValueError("需要 SkillMind v2.5 semantic_distillation_v1 与四维审计契约")
-        return ("ok", "当前 Python 支持 SkillMind v2.5 semantic_distillation_v1 与证据审计")
+            raise ValueError("需要 SkillMind v2.6.1 semantic_distillation_v1/v2、整单元排除核验与诊断契约")
+        return ("ok", "当前 Python 支持 SkillMind v2.6.1 semantic_distillation_v1/v2 与整单元排除核验")
     except (ImportError, AttributeError, ValueError) as e:
         return ("fail",
                 f"SkillMind 语义契约不可用({e})\n"
-                f"      → 当前 Python 需安装支持 semantic_distillation_v1 的 v2.5；或设置 SKILLMIND_REPO")
+                f"      → 当前 Python 需安装支持整单元排除核验的 v2.6.1；或设置 SKILLMIND_REPO")
 
 
 def check(vault: str | None = None) -> None:

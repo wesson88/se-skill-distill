@@ -9,11 +9,13 @@ import math
 from pathlib import Path
 import sys
 import tempfile
+import uuid
 
 import _common as common
 from _common import AuditResult, ensure_skillmind_venv, import_skillmind
 
 SEMANTIC_SCHEMA = "semantic_distillation_v1"
+SEMANTIC_SCHEMAS = common.SEMANTIC_SCHEMAS
 DIMENSIONS = ("coverage_status", "support_status", "synthesis_status", "source_inventory_status")
 STATUSES = frozenset(("PASS", "FAIL", "UNKNOWN"))
 
@@ -24,13 +26,15 @@ def extract_one(source_info: dict, console=None) -> list[dict]:
     return extractor.extract_skill(source_info["raw_path"], source_info, config.load_config(), console=console)
 
 
+@common.with_audit_run
 def extract_batch(source_infos: list[dict], console=None) -> list[dict]:
     results = []
     for info in source_infos:
         try:
-            results.append({"source": info, "drafts": extract_one(info, console=console)})
+            results.append({"source": info, "drafts": extract_one(info, console=console), "run_id": common.current_run_id()})
         except Exception as exc:
-            results.append({"source": info, "drafts": [], "error": f"Extraction failed ({type(exc).__name__})"})
+            diagnostic = common.failure_diagnostic(exc, info.get("source_hash", ""), stage="extract")
+            results.append({"source": info, "drafts": [], "error": diagnostic, "run_id": diagnostic["run_id"]})
     return results
 
 
@@ -59,12 +63,12 @@ def _validate_draft(draft: dict, source_info: dict) -> None:
     if not isinstance(source, dict):
         raise ValueError("Draft source must be an object")
     doc_type = source.get("doc_type", draft.get("doc_type", source_info.get("doc_type", "skill")))
-    if schema and schema != SEMANTIC_SCHEMA:
+    if schema and schema not in SEMANTIC_SCHEMAS:
         raise ValueError("Unsupported draft schema")
-    if schema == SEMANTIC_SCHEMA or doc_type == "skill":
-        if schema != SEMANTIC_SCHEMA or draft.get("extract_complete") is not True:
+    if schema in SEMANTIC_SCHEMAS or doc_type == "skill":
+        if schema not in SEMANTIC_SCHEMAS or draft.get("extract_complete") is not True:
             raise ValueError("Semantic extraction is incomplete or lacks its canonical schema")
-        errors = validate_distillation(draft.get("distillation"))
+        errors = validate_distillation(draft.get("distillation"), schema_version=schema)
         if errors:
             raise ValueError("Invalid semantic draft: " + "; ".join(errors))
         if draft["distillation"]["uncovered"]:
@@ -184,9 +188,10 @@ def _reason_notes(value) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
+@common.with_audit_run
 def audit_one(source_info: dict, role: str, *, vault_skills=None) -> AuditResult:
     """Require exact source/card/artifact correspondence before approval."""
-    result = AuditResult(source_info.get("source_hash", ""), "", role)
+    result = AuditResult(source_info.get("source_hash", ""), "", role, run_id=common.current_run_id())
     try:
         ensure_skillmind_venv()
         _, _, config = import_skillmind()
@@ -259,27 +264,49 @@ def audit_one(source_info: dict, role: str, *, vault_skills=None) -> AuditResult
         items = getattr(report, "items", [])
         if not isinstance(hallucinations, list) or not isinstance(items, list):
             raise ValueError("Malformed audit item lists")
-        result.hallucination_rate = len(hallucinations) / max(len(items), 1)
-        if result.schema_version == SEMANTIC_SCHEMA:
+        if result.schema_version in SEMANTIC_SCHEMAS:
+            # Claims and source inventory units have different denominators.
+            # Only a complete claim judgment set supports a numeric rate.
+            counts = [getattr(report, name, None) for name in ("n_supported", "n_unsupported", "n_claims_unknown")]
+            from skillmind.semantic_auditor import _claim_ids
+            expected_claims = len(_claim_ids([draft for _, draft in drafts]))
+            if (all(type(value) is int and value >= 0 for value in counts)
+                    and counts[2] == 0 and counts[0] + counts[1] == expected_claims
+                    and expected_claims > 0 and getattr(report, "support_status", None) in {"PASS", "FAIL"}):
+                result.hallucination_rate = counts[1] / (counts[0] + counts[1])
+            dimension_errors = []
             for name in DIMENSIONS:
                 status = getattr(report, name, None)
                 if status not in STATUSES:
-                    raise ValueError(f"Malformed semantic dimension: {name}")
+                    dimension_errors.append(f"Malformed semantic dimension: {name}")
+                    status = "UNKNOWN"
                 setattr(result, name, status)
             if result.audit_details.get("integrity_errors"):
                 raise ValueError("Semantic audit contains integrity errors")
             proven_failure = verdict == "FAIL" and any(getattr(result, name) == "FAIL" for name in DIMENSIONS)
+            if dimension_errors:
+                result.audit_details.setdefault("adapter_errors", []).extend(dimension_errors)
+                result.notes.extend(dimension_errors)
+                if not proven_failure:
+                    raise ValueError("; ".join(dimension_errors))
             if result.audit_details.get("evaluation_errors") and not proven_failure:
                 raise ValueError("Semantic audit contains unresolved evaluation errors")
             if verdict == "PASS" and (not all(getattr(result, name) == "PASS" for name in DIMENSIONS) or result.missing):
                 raise ValueError("Semantic PASS lacks complete passing dimensions")
+        elif items and verdict in {"PASS", "FAIL"}:
+            # Legacy audits expose measured SourceItem.verified judgments.
+            verified = [item.get("verified") if isinstance(item, dict) else getattr(item, "verified", None) for item in items]
+            if all(type(value) is bool for value in verified):
+                result.hallucination_rate = len(hallucinations) / len(items)
         result.verdict = verdict
         result.needs_human_review = review
     except Exception as exc:
         result.verdict = "UNKNOWN"
         result.needs_human_review = True
         # Provider/IO exceptions may echo credentials, so only controlled local reasons are copied.
-        reason = str(exc) if isinstance(exc, ValueError) else f"Audit failed ({type(exc).__name__})"
+        diagnostic = common.failure_diagnostic(exc, result.source_hash, stage="audit", cfg=locals().get("cfg"))
+        result.audit_details["audit_error"] = diagnostic
+        reason = diagnostic["error_message"]
         result.notes.append(reason)
         result.audit_details.setdefault("adapter_errors", []).append(reason)
     return result
@@ -291,8 +318,17 @@ def _find_draft_path(source_hash: str) -> str:
     return str(drafts[0][0]) if drafts else ""
 
 
+@common.with_audit_run
 def write_audit_results(results: list[AuditResult]) -> None:
     """Every source is retained; explicit approvals alone enter approved.jsonl."""
+    for result in results:
+        if not result.run_id:
+            result.run_id = common.current_run_id()
+    # Current queues remain replaceable views; each write has an immutable archive.
+    archive = common.AUDIT_DIR / "runs" / (uuid.uuid4().hex + ".jsonl")
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    with archive.open("x", encoding="utf-8") as stream:
+        stream.write("".join(json.dumps(item.to_dict(), ensure_ascii=False) + "\n" for item in results))
     approved = [result for result in results if result.is_approved]
     review = [result for result in results if not result.is_approved]
     for path, items in ((common.APPROVED_FILE, approved), (common.REVIEW_FILE, review), (common.REJECT_FILE, [])):
@@ -306,6 +342,7 @@ def _infer_role_from_source(source: dict) -> str:
     return common.detect_role_from_text((source.get("url") or source.get("source_url") or "") + " " + (source.get("notes") or "")) or "后端工程师"
 
 
+@common.with_audit_run
 def main(argv: list[str] | None = None) -> int:
     import argparse
     from rich.console import Console
@@ -340,7 +377,16 @@ def main(argv: list[str] | None = None) -> int:
             if not any(item.get("source_hash") == info.get("source_hash") for item in source_infos):
                 source_infos.append(info)
     extracted = [] if args.skip_extract else extract_batch(source_infos, console=console)
-    failures = {item["source"].get("source_hash"): item["error"] for item in extracted if item.get("error")}
+    outcomes = {}
+    for info in source_infos:
+        if args.skip_extract:
+            continue
+        matches = [item for item in extracted if item.get("source", {}).get("source_hash") == info.get("source_hash")]
+        item = matches[0] if len(matches) == 1 else {}
+        drafts = item.get("drafts")
+        if (len(matches) != 1 or item.get("error") or not drafts
+                or any(draft.get("extract_complete", True) is not True for draft in drafts)):
+            outcomes[info.get("source_hash")] = item
     results = list(unresolved)
     if args.skip_publish:
         stage = config.get_vault_dir(config.load_config()) / "skills"
@@ -349,11 +395,17 @@ def main(argv: list[str] | None = None) -> int:
         stage_parent = common.AUDIT_DIR / "staging"
         stage_parent.mkdir(parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix="run-", dir=stage_parent))
-        publish_all_drafts([info for info in source_infos if info.get("source_hash") not in failures], console=console, output_dir=stage)
+        publish_all_drafts([info for info in source_infos if info.get("source_hash") not in outcomes], console=console, output_dir=stage)
     for info in source_infos:
         role = args.role or _infer_role_from_source(info)
-        error = failures.get(info.get("source_hash"))
-        result = AuditResult(info.get("source_hash", ""), "", role, notes=[error]) if error else audit_one(info, role, vault_skills=stage)
+        if info.get("source_hash") in outcomes:
+            outcome = outcomes[info.get("source_hash")]
+            error = outcome.get("error")
+            result = AuditResult(info.get("source_hash", ""), "", role, notes=["Extraction failed or incomplete"],
+                                 run_id=outcome.get("run_id", common.current_run_id()),
+                                 audit_details={"extraction_error": error} if error else {"extraction_status": "incomplete"})
+        else:
+            result = audit_one(info, role, vault_skills=stage)
         results.append(result)
         console.print(f"coverage={common.format_coverage(result.coverage)} verdict={result.verdict} needs_review={result.needs_human_review}")
     write_audit_results(results)
