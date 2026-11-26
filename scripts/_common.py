@@ -8,9 +8,56 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
+from contextvars import ContextVar
+from functools import wraps
 from importlib.util import find_spec
 from dataclasses import dataclass, field
 from pathlib import Path
+
+SEMANTIC_SCHEMAS = frozenset(("semantic_distillation_v1", "semantic_distillation_v2"))
+_AUDIT_RUN = ContextVar("se_audit_run", default=None)
+
+
+def current_run_id() -> str | None:
+    return _AUDIT_RUN.get()
+
+
+def with_audit_run(function):
+    """Share the upstream diagnostic identity without changing public signatures."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        import_skillmind()
+        from skillmind.diagnostics import diagnostic_run
+        with diagnostic_run(current_run_id() or uuid.uuid4().hex) as run_id:
+            token = _AUDIT_RUN.set(run_id)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _AUDIT_RUN.reset(token)
+    return wrapped
+
+
+def failure_diagnostic(error, source_hash: str, *, stage: str, cfg=None) -> dict:
+    """Forward the safe original envelope; sanitize and persist unknown failures."""
+    diagnostic = getattr(error, "diagnostic", None)
+    if isinstance(diagnostic, dict):
+        return diagnostic
+    from skillmind.diagnostics import DistillationError, TraceRecorder
+    if cfg is None:
+        try:
+            _, _, config = import_skillmind()
+            cfg = config.load_config()
+            if not isinstance(cfg, dict):
+                raise ValueError("Invalid diagnostic configuration")
+        except Exception:
+            # Without the configured credential inventory an opaque secret in
+            # any message/cause cannot be recognized. Withhold those strings.
+            error = DistillationError(
+                f"{type(error).__name__}: details withheld because diagnostic configuration is unavailable",
+                stage=stage, category=getattr(error, "category", None))
+            cfg = {}
+    return TraceRecorder(cfg, source_hash).failure(error, stage=stage)
 
 # ---------------------------------------------------------------------------
 # 路径常量
@@ -195,7 +242,7 @@ class AuditResult:
     draft_path: str
     role: str
     coverage: float | None = None      # Display only; None means unmeasured.
-    hallucination_rate: float = 0.0     # 0-1,len(hallucinations) / len(items)
+    hallucination_rate: float | None = None  # Unmeasured/partial support stays null.
     needs_human_review: bool = True
     missing: list[dict] = field(default_factory=list)   # [{section, statement, reason}]
     verdict: str = "UNKNOWN"
@@ -211,12 +258,13 @@ class AuditResult:
     artifact_paths: list[str] = field(default_factory=list)
     artifact_sha256: dict[str, str] = field(default_factory=dict)
     audit_details: dict = field(default_factory=dict)
+    run_id: str = ""
 
     @property
     def is_approved(self) -> bool:
         if self.verdict != "PASS" or self.needs_human_review is not False:
             return False
-        if self.schema_version == "semantic_distillation_v1":
+        if self.schema_version in SEMANTIC_SCHEMAS:
             return all(getattr(self, name) == "PASS" for name in (
                 "coverage_status", "support_status", "synthesis_status", "source_inventory_status"
             ))

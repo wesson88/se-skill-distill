@@ -15,6 +15,7 @@ import re
 import _common as common
 
 SEMANTIC_SCHEMA = "semantic_distillation_v1"
+SEMANTIC_SCHEMAS = common.SEMANTIC_SCHEMAS
 
 
 def renderer_module():
@@ -88,7 +89,7 @@ def validate_destinations(routed) -> tuple[Path, Path]:
 
 
 def validate_semantic(draft: dict) -> None:
-    if draft.get("schema_version") == SEMANTIC_SCHEMA:
+    if draft.get("schema_version") in SEMANTIC_SCHEMAS:
         renderer_module()
         from skillmind.distillation import renderable_sections
         try:
@@ -143,6 +144,7 @@ def validate_audit(routed, draft: dict) -> None:
     if saved != draft:
         raise ValueError("Passed draft differs from the persisted audited card")
     expected = Counter()
+    audited_cards = []
     for path in drafts:
         card = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(card, dict) or source_hash(card) != audit.source_hash:
@@ -150,10 +152,15 @@ def validate_audit(routed, draft: dict) -> None:
         if card.get("schema_version", "") != audit.schema_version:
             raise ValueError("Audited cards mix schemas")
         validate_semantic(card)
+        audited_cards.append(card)
         raw = (card.get("source") or {}).get("raw_path")
         if raw and sha256_file(Path(raw)) != audit.audit_details["source_sha256"]:
             raise ValueError("Raw source changed after audit")
         expected[canonical_json(evidence_draft(card))] += 1
+    if audit.schema_version == "semantic_distillation_v2":
+        common.import_skillmind()
+        from skillmind.semantic_auditor import validate_exclusion_approval
+        validate_exclusion_approval(audited_cards, audit.audit_details.get("semantic_evidence"))
     artifacts = _bound_paths(audit.artifact_paths, audit.artifact_sha256, "staging artifact")
     sidecar_paths = [str(Path(path).with_suffix(".evidence.json")) for path in artifacts]
     _bound_paths(sidecar_paths, audit.audit_details.get("staging_sidecar_sha256"), "staging sidecar")

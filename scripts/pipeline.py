@@ -54,6 +54,7 @@ def _load_draft(path: str) -> dict | None:
         return None
 
 
+@_common.with_audit_run
 def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = False, domain: str = "se") -> int:
     """Dry-run may call models and write staging, but never writes final vault files."""
     console = Console()
@@ -64,7 +65,7 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
     audit = _load_stage("02_audit.py")
     route = _load_stage("03_route.py")
     inject = _load_stage("04_inject.py")
-    stage_root = _common.STATE_DIR / "runs" / uuid.uuid4().hex / "published"
+    stage_root = _common.STATE_DIR / "runs" / hashlib.sha256(_common.current_run_id().encode()).hexdigest() / "published"
     results: list[AuditResult] = []
     source_by_hash: dict[str, dict] = {}
     for requested, documents in ingest.ingest_batch(sources, console=console):
@@ -88,7 +89,11 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
                 if (len(extracted) != 1 or extracted[0].get("error")
                         or not extracted[0].get("drafts")
                         or any(d.get("extract_complete", True) is not True for d in extracted[0]["drafts"])):
-                    results.append(AuditResult(sh, "", role, notes=["提取失败或不完整，未发布/审计旧草稿"]))
+                    extraction = extracted[0] if len(extracted) == 1 else {}
+                    error = extraction.get("error")
+                    results.append(AuditResult(sh, "", role, notes=["提取失败或不完整，未发布/审计旧草稿"],
+                        run_id=extraction.get("run_id", _common.current_run_id()),
+                        audit_details={"extraction_error": error} if error else {"extraction_status": "incomplete"}))
                     continue
             stage = stage_root / hashlib.sha256(sh.encode("utf-8")).hexdigest()
             count = audit.publish_all_drafts([source], console=console, output_dir=stage)
@@ -99,11 +104,14 @@ def run_pipeline(config_path: Path, dry_run: bool = False, skip_extract: bool = 
             results.append(report)
             console.print(f"  coverage={format_coverage(report.coverage)} verdict={report.verdict} review={report.needs_human_review}")
         except Exception as error:
-            results.append(AuditResult(sh, "", role, notes=[f"发布/审计失败：{type(error).__name__}"],
-                                       audit_details={"error_type": type(error).__name__}))
+            diagnostic = _common.failure_diagnostic(error, sh, stage="publication_or_audit")
+            results.append(AuditResult(sh, "", role, notes=["发布/审计失败"], run_id=diagnostic["run_id"],
+                                       audit_details={"audit_error": diagnostic}))
     injected, patches, routed = [], [], []
     reserved: set[tuple[str, str, int]] = set()
     for report in results:
+        if not report.run_id:
+            report.run_id = _common.current_run_id()
         if not report.is_approved:
             continue
         paths = report.draft_paths or ([report.draft_path] if report.draft_path else [])
